@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>雪球动态监控</title>
+    <meta name="description" content="雪球作者动态监控看板 — 实时追踪关注作者的最新投资观点">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- 顶部导航 -->
+    <nav class="navbar">
+        <div class="navbar-brand">
+            <div class="icon">📊</div>
+            <span>雪球动态监控</span>
+        </div>
+        <div class="navbar-actions">
+            <span class="last-update" id="lastUpdate">加载中...</span>
+            <button class="btn-refresh" id="btnRefresh" onclick="refreshData()">
+                <span class="spinner"></span>
+                <span class="label">🔄 手动刷新</span>
+            </button>
+        </div>
+    </nav>
+
+    <!-- 主内容 -->
+    <div class="container">
+        <div class="layout">
+            <!-- 左侧作者面板 -->
+            <aside class="authors-panel" id="authorsPanel">
+                <div class="panel-title">关注作者</div>
+                <div class="author-card author-card-all active" data-author="all" onclick="filterByAuthor('all', this)">
+                    <div class="author-name">📋 全部动态</div>
+                    <div class="author-meta">
+                        <span id="totalPosts">0 条</span>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- 右侧帖子列表 -->
+            <main class="posts-area">
+                <div class="posts-header">
+                    <h1 class="posts-title" id="postsTitle">全部动态</h1>
+                    <span class="posts-count" id="postsCount">0 条</span>
+                </div>
+                <div id="postsList">
+                    <div class="empty-state">
+                        <div class="icon">📡</div>
+                        <p>正在加载数据...</p>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- 加载遮罩 -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-box">
+            <div class="spinner-lg"></div>
+            <p>正在抓取雪球数据...</p>
+            <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">首次启动需要约 15 秒</p>
+        </div>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div class="toast" id="toast"></div>
+
+    <script>
+        let allPosts = [];
+        let currentFilter = 'all';
+        const COLORS = ['#f59e0b', '#06b6d4', '#10b981', '#f43f5e', '#8b5cf6', '#ec4899', '#14b8a6'];
+
+        // 获取作者姓名首字
+        function getInitial(name) {
+            return name ? name.charAt(0).toUpperCase() : '?';
+        }
+
+        // 获取作者颜色
+        function getAuthorColor(name) {
+            let h = 0;
+            for (let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
+            return COLORS[Math.abs(h) % COLORS.length];
+        }
+
+        // 渲染帖子列表
+        function renderPosts(posts) {
+            const container = document.getElementById('postsList');
+            const countEl = document.getElementById('postsCount');
+            countEl.textContent = `${posts.length} 条`;
+
+            if (!posts.length) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">📭</div>
+                        <p>暂无动态</p>
+                    </div>`;
+                return;
+            }
+
+            container.innerHTML = posts.map((p, idx) => {
+                const color = getAuthorColor(p.user_name || '');
+                const initial = getInitial(p.user_name);
+                const title = p.title || '';
+                const text = p.text || '';
+                const displayText = text && text !== title ? text : '';
+                const targetUrl = p.target ? (p.target.startsWith('http') ? p.target : `https://xueqiu.com${p.target}`) : '';
+
+                return `
+                    <div class="post-card" style="animation-delay: ${idx * 0.05}s">
+                        <div class="post-header">
+                            <div class="post-avatar" style="background: linear-gradient(135deg, ${color}, ${color}99)">${initial}</div>
+                            <div>
+                                <div class="post-author">${p.user_name || '未知'}</div>
+                                <div class="post-time">${targetUrl ? `<a href="${targetUrl}" target="_blank" style="color:var(--text-muted);text-decoration:none;">${p.created_at_fmt || ''}</a>` : (p.created_at_fmt || '')}</div>
+                            </div>
+                        </div>
+                        ${title ? `<div class="post-title">${targetUrl ? `<a href="${targetUrl}" target="_blank" style="color:var(--accent-cyan);text-decoration:none;">🔗 专栏 | ${formatText(title)}</a>` : formatText(title)}</div>` : ''}
+                        ${displayText ? `<div class="post-text">${formatText(displayText)}${targetUrl && displayText.endsWith('...') ? `  <a href="${targetUrl}" target="_blank" style="color:var(--accent-cyan); font-weight: 500;">阅读全文 &gt;</a>` : ''}</div>` : ''}
+                        <div class="post-stats">
+                            <span class="post-stat"><span class="icon">💬</span> ${p.reply_count || 0}</span>
+                            <span class="post-stat"><span class="icon">🔄</span> ${p.retweet_count || 0}</span>
+                            <span class="post-stat"><span class="icon">❤️</span> ${p.like_count || 0}</span>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        // 转义并高亮URL/转发
+        function formatText(str) {
+            const d = document.createElement('div');
+            d.textContent = str; // Escape HTML securely
+            let html = d.innerHTML;
+
+            // Linkify URLs
+            html = html.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+
+            // Handle Retweets format: [转发] @User: \n...
+            if (html.includes('[转发] @')) {
+                const parts = html.split(/\[转发\] @(.*?): \n/);
+                if (parts.length >= 3) {
+                    let formatted = parts[0];
+                    for (let i = 1; i < parts.length; i += 2) {
+                        const rtUser = parts[i];
+                        const rtText = parts[i+1];
+                        formatted += `<div class="retweet-box"><b>@${rtUser}</b>:<br>${rtText}</div>`;
+                    }
+                    html = formatted;
+                }
+            }
+            return html;
+        }
+
+        // 渲染作者面板
+        function renderAuthors(authors) {
+            const panel = document.getElementById('authorsPanel');
+            // 保留 "全部" 卡片
+            const allCard = panel.querySelector('[data-author="all"]');
+            const existingCards = panel.querySelectorAll('[data-author]:not([data-author="all"])');
+            existingCards.forEach(c => c.remove());
+
+            document.getElementById('totalPosts').textContent = `${allPosts.length} 条`;
+
+            authors.forEach(a => {
+                const color = getAuthorColor(a.user_name || '');
+                const card = document.createElement('div');
+                card.className = 'author-card';
+                card.dataset.author = a.user_id;
+                card.onclick = function() { filterByAuthor(a.user_id, this); };
+                card.innerHTML = `
+                    <div class="author-name" style="color: ${color}">${a.user_name || a.user_id}</div>
+                    <div class="author-meta">
+                        <span>${a.total} 条</span>
+                        <span>${a.latest_at_fmt || ''}</span>
+                    </div>`;
+                panel.appendChild(card);
+            });
+        }
+
+        // 按作者过滤
+        function filterByAuthor(authorId, el) {
+            currentFilter = authorId;
+            // 更新 active 状态
+            document.querySelectorAll('.author-card').forEach(c => c.classList.remove('active'));
+            if (el) el.classList.add('active');
+
+            const titleEl = document.getElementById('postsTitle');
+            if (authorId === 'all') {
+                titleEl.textContent = '全部动态';
+                renderPosts(allPosts);
+            } else {
+                const filtered = allPosts.filter(p => p.user_id === authorId);
+                const name = filtered.length ? filtered[0].user_name : authorId;
+                titleEl.textContent = `${name} 的动态`;
+                renderPosts(filtered);
+            }
+        }
+
+        // 加载数据
+        async function loadData() {
+            try {
+                const [postsRes, authorsRes] = await Promise.all([
+                    fetch('/api/posts?limit=100'),
+                    fetch('/api/authors')
+                ]);
+                const postsData = await postsRes.json();
+                const authorsData = await authorsRes.json();
+
+                allPosts = postsData.posts || [];
+                renderAuthors(authorsData.authors || []);
+                filterByAuthor(currentFilter, document.querySelector(`[data-author="${currentFilter}"]`));
+
+                // 更新时间
+                if (postsData.last_fetch) {
+                    document.getElementById('lastUpdate').textContent = `最近更新: ${postsData.last_fetch.replace('T', ' ').substring(0, 19)}`;
+                }
+            } catch (e) {
+                console.error('加载失败:', e);
+            }
+        }
+
+        // 手动刷新
+        async function refreshData() {
+            const btn = document.getElementById('btnRefresh');
+            const overlay = document.getElementById('loadingOverlay');
+            btn.classList.add('loading');
+            btn.disabled = true;
+            overlay.classList.add('show');
+
+            try {
+                const res = await fetch('/api/refresh', { method: 'POST' });
+                const data = await res.json();
+
+                if (data.status === 'ok') {
+                    showToast(`✅ 抓取完成！获取 ${data.total_fetched} 条，新增 ${data.new_posts} 条`, 'success');
+                    await loadData();
+                } else if (data.status === 'skipped') {
+                    showToast('⏳ 上一次抓取尚未完成', 'error');
+                } else {
+                    showToast(`❌ ${data.message || '抓取失败'}`, 'error');
+                }
+            } catch (e) {
+                showToast('❌ 网络错误', 'error');
+            } finally {
+                btn.classList.remove('loading');
+                btn.disabled = false;
+                overlay.classList.remove('show');
+            }
+        }
+
+        // Toast 提示
+        function showToast(msg, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.className = `toast ${type} show`;
+            setTimeout(() => toast.classList.remove('show'), 4000);
+        }
+
+        // 初始化
+        loadData();
+        // 每 5 分钟自动刷新前端数据
+        setInterval(loadData, 5 * 60 * 1000);
+    </script>
+</body>
+</html>
