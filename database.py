@@ -57,6 +57,12 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id);
             CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS authors (
+                user_id   TEXT PRIMARY KEY,
+                name      TEXT NOT NULL DEFAULT '',
+                added_at  TEXT DEFAULT ''
+            );
         """)
 
 
@@ -124,3 +130,63 @@ def get_authors_summary() -> list:
             FROM posts GROUP BY user_id ORDER BY latest_at DESC
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+# ==================== 作者管理 ====================
+
+def get_db_authors() -> list:
+    """从数据库获取作者列表"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            "SELECT user_id, name, added_at FROM authors ORDER BY added_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_author(user_id: str, name: str) -> bool:
+    """添加作者，成功返回 True，已存在返回 False"""
+    if not user_id or not name:
+        return False
+    now = datetime.now().isoformat()
+    with _ConnCtx() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO authors (user_id, name, added_at) VALUES (?, ?, ?)",
+                (str(user_id), name.strip(), now),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def delete_author(user_id: str) -> bool:
+    """删除作者，返回 True"""
+    if not user_id:
+        return False
+    with _ConnCtx() as conn:
+        conn.execute("DELETE FROM authors WHERE user_id = ?", (str(user_id),))
+        conn.commit()
+    return True
+
+
+def update_author(user_id: str, name: str) -> bool:
+    """更新作者名称"""
+    if not user_id or not name:
+        return False
+    with _ConnCtx() as conn:
+        conn.execute(
+            "UPDATE authors SET name = ? WHERE user_id = ?",
+            (name.strip(), str(user_id)),
+        )
+        conn.commit()
+    return True
+
+
+def seed_authors_from_config(authors_list: list):
+    """首次启动时从 config.AUTHORS 初始化作者表"""
+    existing = get_db_authors()
+    if existing:
+        return  # 已有作者，跳过
+    for a in authors_list:
+        add_author(a["id"], a.get("name", a["id"]))

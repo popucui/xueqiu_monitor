@@ -17,6 +17,9 @@
         </div>
         <div class="navbar-actions">
             <span class="last-update" id="lastUpdate">加载中...</span>
+            <button class="btn-edit-authors" id="btnEditAuthors" onclick="openAuthorModal()">
+                <span class="label">⚙️ 管理作者</span>
+            </button>
             <button class="btn-refresh" id="btnRefresh" onclick="refreshData()">
                 <span class="spinner"></span>
                 <span class="label">🔄 手动刷新</span>
@@ -66,9 +69,31 @@
     <!-- Toast 通知 -->
     <div class="toast" id="toast"></div>
 
+    <!-- 作者管理弹窗 -->
+    <div class="modal-overlay" id="authorModal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2>管理关注作者</h2>
+                <button class="modal-close" onclick="closeAuthorModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-section-title">当前作者</div>
+                <div id="modalAuthorList"></div>
+                <div class="modal-divider"></div>
+                <div class="modal-section-title">添加新作者</div>
+                <div class="add-author-form">
+                    <input type="text" id="newAuthorId" placeholder="雪球用户 ID，如 5074386049" />
+                    <input type="text" id="newAuthorName" placeholder="作者昵称，如 JackWalk" />
+                    <button class="btn-add-author" onclick="addAuthor()">添加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         let allPosts = [];
         let currentFilter = 'all';
+        let dbAuthors = [];  // 来自数据库的作者列表（用于管理）
         const COLORS = ['#f59e0b', '#06b6d4', '#10b981', '#f43f5e', '#8b5cf6', '#ec4899', '#14b8a6'];
 
         // 获取作者姓名首字
@@ -172,7 +197,8 @@
                     <div class="author-meta">
                         <span>${a.total} 条</span>
                         <span>${a.latest_at_fmt || ''}</span>
-                    </div>`;
+                    </div>
+                    <button class="author-del-btn" title="删除作者" onclick="event.stopPropagation(); confirmDeleteAuthor('${a.user_id}', '${a.user_name || a.user_id}')">✕</button>`;
                 panel.appendChild(card);
             });
         }
@@ -207,7 +233,20 @@
                 const authorsData = await authorsRes.json();
 
                 allPosts = postsData.posts || [];
-                renderAuthors(authorsData.authors || []);
+                dbAuthors = authorsData.db_authors || [];
+
+                // 构建 user_id -> 统计摘要 的映射
+                const summaryMap = {};
+                (authorsData.authors || []).forEach(s => { summaryMap[s.user_id] = s; });
+
+                // 以 dbAuthors 为主（完整列表），合并统计信息
+                const enrichedAuthors = dbAuthors.map(a => ({
+                    user_id: a.user_id,
+                    user_name: a.name,
+                    total: summaryMap[a.user_id] ? summaryMap[a.user_id].total : 0,
+                    latest_at_fmt: summaryMap[a.user_id] ? summaryMap[a.user_id].latest_at_fmt : '',
+                }));
+                renderAuthors(enrichedAuthors);
                 filterByAuthor(currentFilter, document.querySelector(`[data-author="${currentFilter}"]`));
 
                 // 更新时间
@@ -254,6 +293,73 @@
             toast.textContent = msg;
             toast.className = `toast ${type} show`;
             setTimeout(() => toast.classList.remove('show'), 4000);
+        }
+
+        // ===== 作者管理弹窗 =====
+        function openAuthorModal() {
+            renderModalAuthors();
+            document.getElementById('authorModal').classList.add('show');
+        }
+
+        function closeAuthorModal() {
+            document.getElementById('authorModal').classList.remove('show');
+            document.getElementById('newAuthorId').value = '';
+            document.getElementById('newAuthorName').value = '';
+        }
+
+        function renderModalAuthors() {
+            const list = document.getElementById('modalAuthorList');
+            if (!dbAuthors.length) {
+                list.innerHTML = '<div class="modal-empty">暂无作者，请添加</div>';
+                return;
+            }
+            list.innerHTML = dbAuthors.map(a => `
+                <div class="modal-author-item">
+                    <div class="modal-author-info">
+                        <span class="modal-author-name">${a.name || a.user_id}</span>
+                        <span class="modal-author-id">${a.user_id}</span>
+                    </div>
+                    <button class="btn-icon-danger" onclick="deleteAuthor('${a.user_id}')" title="删除">✕</button>
+                </div>`).join('');
+        }
+
+        async function addAuthor() {
+            const userId = document.getElementById('newAuthorId').value.trim();
+            const name = document.getElementById('newAuthorName').value.trim();
+            if (!userId || !name) {
+                showToast('❌ user_id 和昵称都不能为空', 'error');
+                return;
+            }
+            const res = await fetch('/api/authors', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({user_id: userId, name}),
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast(`✅ 已添加 ${name}`, 'success');
+                await loadData();
+                renderModalAuthors();
+                document.getElementById('newAuthorId').value = '';
+                document.getElementById('newAuthorName').value = '';
+                // 自动刷新获取新作者动态
+                showToast('📡 正在抓取新作者动态...', 'success');
+                await refreshData();
+            } else {
+                showToast(`❌ ${data.message}`, 'error');
+            }
+        }
+
+        async function deleteAuthor(userId) {
+            if (!confirm('确定删除该作者？')) return;
+            await fetch(`/api/authors/${userId}`, {method: 'DELETE'});
+            showToast('✅ 已删除', 'success');
+            await loadData();
+            renderModalAuthors();
+        }
+
+        function confirmDeleteAuthor(userId, name) {
+            deleteAuthor(userId);
         }
 
         // 初始化

@@ -1,8 +1,8 @@
 """
 雪球作者动态监控看板 — Flask Web 应用
 """
-import sys
 import os
+import sys
 import threading
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request
@@ -30,7 +30,9 @@ def do_fetch():
     try:
         fetcher = XueqiuFetcher(config.XQ_A_TOKEN, config.XQ_R_TOKEN)
         fetcher.start()
-        all_posts = fetcher.fetch_all_authors(config.AUTHORS, config.POST_COUNT)
+        db_authors = database.get_db_authors()
+        authors = [{"id": a["user_id"], "name": a["name"]} for a in db_authors]
+        all_posts = fetcher.fetch_all_authors(authors, config.POST_COUNT)
         fetcher.stop()
 
         new_posts = database.save_posts(all_posts)
@@ -88,7 +90,37 @@ def api_authors():
             s["latest_at_fmt"] = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
         else:
             s["latest_at_fmt"] = ""
-    return jsonify({"authors": summary, "config_authors": config.AUTHORS})
+    db_authors = database.get_db_authors()
+    return jsonify({"authors": summary, "db_authors": db_authors})
+
+
+@app.route("/api/authors", methods=["POST"])
+def api_add_author():
+    data = request.get_json()
+    user_id = str(data.get("user_id", "")).strip()
+    name = str(data.get("name", "")).strip()
+    if not user_id or not name:
+        return jsonify({"status": "error", "message": "user_id 和 name 不能为空"}), 400
+    ok = database.add_author(user_id, name)
+    if ok:
+        return jsonify({"status": "ok", "user_id": user_id, "name": name})
+    return jsonify({"status": "error", "message": "作者已存在"}), 409
+
+
+@app.route("/api/authors/<user_id>", methods=["DELETE"])
+def api_delete_author(user_id):
+    database.delete_author(user_id)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/authors/<user_id>", methods=["PUT"])
+def api_update_author(user_id):
+    data = request.get_json()
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"status": "error", "message": "name 不能为空"}), 400
+    database.update_author(user_id, name)
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/refresh", methods=["POST"])
@@ -100,8 +132,8 @@ def api_refresh():
 # ==================== 启动 ====================
 
 if __name__ == "__main__":
-    import os
     database.init_db()
+    database.seed_authors_from_config(config.AUTHORS)
 
     # 仅在主进程（非 reloader 子进程）中执行首次抓取和调度器
     # WERKZEUG_RUN_MAIN 环境变量在 reloader 子进程中被设为 "true"
@@ -115,5 +147,6 @@ if __name__ == "__main__":
         print("🔁 Reloader 子进程已启动")
 
     # 启动 Web 服务（debug=True 开启代码自动重载）
+    import os
     print(f"\n🌐 看板地址: http://localhost:{config.WEB_PORT}/")
-    app.run(host=config.WEB_HOST, port=config.WEB_PORT, debug=True)
+    app.run(host=config.WEB_HOST, port=config.WEB_PORT, debug=True, reloader_type="stat")
