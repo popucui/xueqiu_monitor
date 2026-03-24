@@ -96,6 +96,13 @@
         let dbAuthors = [];  // 来自数据库的作者列表（用于管理）
         const COLORS = ['#f59e0b', '#06b6d4', '#10b981', '#f43f5e', '#8b5cf6', '#ec4899', '#14b8a6'];
 
+        // XSS 防护：转义 HTML 特殊字符
+        function escapeHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+
         // 获取作者姓名首字
         function getInitial(name) {
             return name ? name.charAt(0).toUpperCase() : '?';
@@ -125,23 +132,29 @@
 
             container.innerHTML = posts.map((p, idx) => {
                 const color = getAuthorColor(p.user_name || '');
-                const initial = getInitial(p.user_name);
+                const initial = escapeHtml(getInitial(p.user_name));
                 const title = p.title || '';
                 const text = p.text || '';
                 const displayText = text && text !== title ? text : '';
-                const targetUrl = p.target ? (p.target.startsWith('http') ? p.target : `https://xueqiu.com${p.target}`) : '';
+                // 只允许已知安全的相对路径和 https 链接，防止 javascript: 伪协议
+                const rawTarget = p.target || '';
+                const targetUrl = rawTarget.startsWith('http')
+                    ? rawTarget
+                    : (rawTarget.startsWith('/') ? `https://xueqiu.com${rawTarget}` : '');
+                const safeAuthor = escapeHtml(p.user_name || '未知');
+                const safeTime = escapeHtml(p.created_at_fmt || '');
 
                 return `
                     <div class="post-card" style="animation-delay: ${idx * 0.05}s">
                         <div class="post-header">
                             <div class="post-avatar" style="background: linear-gradient(135deg, ${color}, ${color}99)">${initial}</div>
                             <div>
-                                <div class="post-author">${p.user_name || '未知'}</div>
-                                <div class="post-time">${targetUrl ? `<a href="${targetUrl}" target="_blank" style="color:var(--text-muted);text-decoration:none;">${p.created_at_fmt || ''}</a>` : (p.created_at_fmt || '')}</div>
+                                <div class="post-author">${safeAuthor}</div>
+                                <div class="post-time">${targetUrl ? `<a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--text-muted);text-decoration:none;">${safeTime}</a>` : safeTime}</div>
                             </div>
                         </div>
-                        ${title ? `<div class="post-title">${targetUrl ? `<a href="${targetUrl}" target="_blank" style="color:var(--accent-cyan);text-decoration:none;">🔗 专栏 | ${formatText(title)}</a>` : formatText(title)}</div>` : ''}
-                        ${displayText ? `<div class="post-text">${formatText(displayText)}${targetUrl && displayText.endsWith('...') ? `  <a href="${targetUrl}" target="_blank" style="color:var(--accent-cyan); font-weight: 500;">阅读全文 &gt;</a>` : ''}</div>` : ''}
+                        ${title ? `<div class="post-title">${targetUrl ? `<a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-cyan);text-decoration:none;">🔗 专栏 | ${formatText(title)}</a>` : formatText(title)}</div>` : ''}
+                        ${displayText ? `<div class="post-text">${formatText(displayText)}${targetUrl && displayText.endsWith('...') ? `  <a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-cyan); font-weight: 500;">阅读全文 &gt;</a>` : ''}</div>` : ''}
                         <div class="post-stats">
                             <span class="post-stat"><span class="icon">💬</span> ${p.reply_count || 0}</span>
                             <span class="post-stat"><span class="icon">🔄</span> ${p.retweet_count || 0}</span>
@@ -157,8 +170,8 @@
             d.textContent = str; // Escape HTML securely
             let html = d.innerHTML;
 
-            // Linkify URLs
-            html = html.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+            // Linkify URLs（排除末尾中文标点，加 noopener 防 tab-nabbing）
+            html = html.replace(/(https?:\/\/[^\s<>"'，。、？！）\]]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
 
             // Handle Retweets format: [转发] @User: \n...
             if (html.includes('[转发] @')) {
@@ -192,13 +205,25 @@
                 card.className = 'author-card';
                 card.dataset.author = a.user_id;
                 card.onclick = function() { filterByAuthor(a.user_id, this); };
-                card.innerHTML = `
-                    <div class="author-name" style="color: ${color}">${a.user_name || a.user_id}</div>
-                    <div class="author-meta">
-                        <span>${a.total} 条</span>
-                        <span>${a.latest_at_fmt || ''}</span>
-                    </div>
-                    <button class="author-del-btn" title="删除作者" onclick="event.stopPropagation(); confirmDeleteAuthor('${a.user_id}', '${a.user_name || a.user_id}')">✕</button>`;
+                // 使用 DOM API 赋值，避免 XSS
+                const nameDiv = document.createElement('div');
+                nameDiv.className = 'author-name';
+                nameDiv.style.color = color;
+                nameDiv.textContent = a.user_name || a.user_id;
+                const metaDiv = document.createElement('div');
+                metaDiv.className = 'author-meta';
+                metaDiv.innerHTML = `<span>${escapeHtml(String(a.total))} 条</span><span>${escapeHtml(a.latest_at_fmt || '')}</span>`;
+                const delBtn = document.createElement('button');
+                delBtn.className = 'author-del-btn';
+                delBtn.title = '删除作者';
+                delBtn.textContent = '✕';
+                delBtn.onclick = function(e) {
+                    e.stopPropagation();
+                    confirmDeleteAuthor(a.user_id, a.user_name || a.user_id);
+                };
+                card.appendChild(nameDiv);
+                card.appendChild(metaDiv);
+                card.appendChild(delBtn);
                 panel.appendChild(card);
             });
         }
@@ -316,10 +341,10 @@
             list.innerHTML = dbAuthors.map(a => `
                 <div class="modal-author-item">
                     <div class="modal-author-info">
-                        <span class="modal-author-name">${a.name || a.user_id}</span>
-                        <span class="modal-author-id">${a.user_id}</span>
+                        <span class="modal-author-name">${escapeHtml(a.name || a.user_id)}</span>
+                        <span class="modal-author-id">${escapeHtml(a.user_id)}</span>
                     </div>
-                    <button class="btn-icon-danger" onclick="deleteAuthor('${a.user_id}')" title="删除">✕</button>
+                    <button class="btn-icon-danger" onclick="deleteAuthor('${escapeHtml(a.user_id)}')" title="删除">✕</button>
                 </div>`).join('');
         }
 
@@ -359,6 +384,7 @@
         }
 
         function confirmDeleteAuthor(userId, name) {
+            if (!confirm(`确定删除「${name}」？删除后该作者的历史帖子仍会保留。`)) return;
             deleteAuthor(userId);
         }
 

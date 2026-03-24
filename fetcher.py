@@ -5,6 +5,7 @@ import re
 import json
 import html
 from datetime import datetime
+from urllib.parse import urlencode
 from playwright.sync_api import sync_playwright
 
 # 常见雪球表情映射
@@ -121,9 +122,16 @@ class XueqiuFetcher:
         self._pw = None
         self._page = None
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
+
     def _fetch_api(self, path: str, params: dict) -> dict:
-        qs = "&".join(f"{k}={v}" for k, v in params.items())
-        url = f"{path}?{qs}"
+        url = f"{path}?{urlencode(params)}"
         try:
             return self._page.evaluate("""
                 async (url) => {

@@ -69,7 +69,10 @@ def index():
 @app.route("/api/posts")
 def api_posts():
     author_id = request.args.get("author_id", None)
-    limit = int(request.args.get("limit", 50))
+    try:
+        limit = min(int(request.args.get("limit", 50)), 500)
+    except (ValueError, TypeError):
+        limit = 50
     posts = database.get_recent_posts(limit, author_id)
     # 转换时间戳为可读格式
     for p in posts:
@@ -133,7 +136,6 @@ def api_refresh():
 
 if __name__ == "__main__":
     database.init_db()
-    database.seed_authors_from_config(config.AUTHORS)
 
     # 仅在主进程（非 reloader 子进程）中执行首次抓取和调度器
     # WERKZEUG_RUN_MAIN 环境变量在 reloader 子进程中被设为 "true"
@@ -147,6 +149,5 @@ if __name__ == "__main__":
         print("🔁 Reloader 子进程已启动")
 
     # 启动 Web 服务（debug=True 开启代码自动重载）
-    import os
-    print(f"\n🌐 看板地址: http://localhost:{config.WEB_PORT}/")
+    print(f"\n🌐 看板地址: http://{config.WEB_HOST}:{config.WEB_PORT}/")
     app.run(host=config.WEB_HOST, port=config.WEB_PORT, debug=True, reloader_type="stat")

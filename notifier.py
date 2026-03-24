@@ -2,7 +2,7 @@
 推送通知模块
 支持：控制台输出、企业微信、飞书、钉钉 Webhook
 """
-import json
+import time
 import requests
 from datetime import datetime
 
@@ -58,28 +58,38 @@ def _build_markdown(posts):
     return "\n".join(lines)
 
 
+def _post_with_retry(url: str, payload: dict, name: str, max_retries: int = 3):
+    """带指数退避重试的 Webhook POST"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=5)
+            resp.raise_for_status()
+            return
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"  ⚠️ {name}推送失败（已重试 {max_retries} 次）: {e}")
+            else:
+                wait = 2 ** (attempt - 1)  # 1s, 2s
+                print(f"  ⚠️ {name}推送失败，{wait}s 后重试（{attempt}/{max_retries}）: {e}")
+                time.sleep(wait)
+
+
 def _notify_wechat(posts, url):
     md = _build_markdown(posts)
-    try:
-        requests.post(url, json={"msgtype": "markdown", "markdown": {"content": md}}, timeout=5)
-    except Exception as e:
-        print(f"  ⚠️ 企业微信推送失败: {e}")
+    _post_with_retry(url, {"msgtype": "markdown", "markdown": {"content": md}}, "企业微信")
 
 
 def _notify_feishu(posts, url):
     md = _build_markdown(posts)
-    try:
-        requests.post(url, json={"msg_type": "interactive", "card": {
+    _post_with_retry(url, {
+        "msg_type": "interactive",
+        "card": {
             "header": {"title": {"tag": "plain_text", "content": f"🔔 雪球新动态 ({len(posts)} 条)"}},
-            "elements": [{"tag": "markdown", "content": md}]
-        }}, timeout=5)
-    except Exception as e:
-        print(f"  ⚠️ 飞书推送失败: {e}")
+            "elements": [{"tag": "markdown", "content": md}],
+        },
+    }, "飞书")
 
 
 def _notify_dingtalk(posts, url):
     md = _build_markdown(posts)
-    try:
-        requests.post(url, json={"msgtype": "markdown", "markdown": {"title": "雪球新动态", "text": md}}, timeout=5)
-    except Exception as e:
-        print(f"  ⚠️ 钉钉推送失败: {e}")
+    _post_with_retry(url, {"msgtype": "markdown", "markdown": {"title": "雪球新动态", "text": md}}, "钉钉")

@@ -6,14 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# ==================== 作者列表 ====================
-AUTHORS = [
-    {"id": "5074386049", "name": "JackWalk"},
-    {"id": "1634692981", "name": "周期小黑马"},
-    {"id": "1156379534", "name": "LianDeveloper"},
-    {"id": "3350642636", "name": "亲爱的阿兰"},
-    {"id": "1890433959", "name": "月色沾衣"},
-]
+# 作者列表已移至数据库管理，请通过 Web UI（⚙️ 管理作者）添加初始作者
 
 
 # ==================== 雪球认证 ====================
@@ -33,6 +26,7 @@ FEISHU_WEBHOOK_URL = ""
 DINGTALK_WEBHOOK_URL = ""
 
 # ==================== Web 看板 ====================
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 5001
+# 安全建议：默认仅监听本机，如需局域网访问可在 .env 中设置 WEB_HOST=0.0.0.0
+WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
+WEB_PORT = int(os.getenv("WEB_PORT", "5001"))
 DB_PATH = "xueqiu_monitor.db"

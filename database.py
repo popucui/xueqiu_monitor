@@ -19,7 +19,6 @@ def _get_db_path():
 def get_conn():
     conn = sqlite3.connect(_get_db_path())
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -40,6 +39,8 @@ class _ConnCtx:
 
 def init_db():
     with _ConnCtx() as conn:
+        # WAL 模式只需设置一次（持久化），放在初始化阶段
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS posts (
                 id            TEXT PRIMARY KEY,
@@ -183,10 +184,4 @@ def update_author(user_id: str, name: str) -> bool:
     return True
 
 
-def seed_authors_from_config(authors_list: list):
-    """首次启动时从 config.AUTHORS 初始化作者表"""
-    existing = get_db_authors()
-    if existing:
-        return  # 已有作者，跳过
-    for a in authors_list:
-        add_author(a["id"], a.get("name", a["id"]))
+
