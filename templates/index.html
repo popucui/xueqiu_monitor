@@ -338,14 +338,35 @@
                 list.innerHTML = '<div class="modal-empty">暂无作者，请添加</div>';
                 return;
             }
-            list.innerHTML = dbAuthors.map(a => `
-                <div class="modal-author-item">
-                    <div class="modal-author-info">
-                        <span class="modal-author-name">${escapeHtml(a.name || a.user_id)}</span>
-                        <span class="modal-author-id">${escapeHtml(a.user_id)}</span>
-                    </div>
-                    <button class="btn-icon-danger" onclick="deleteAuthor('${escapeHtml(a.user_id)}')" title="删除">✕</button>
-                </div>`).join('');
+
+            list.innerHTML = '';
+            dbAuthors.forEach(a => {
+                const item = document.createElement('div');
+                item.className = 'modal-author-item';
+
+                const info = document.createElement('div');
+                info.className = 'modal-author-info';
+
+                const nameEl = document.createElement('span');
+                nameEl.className = 'modal-author-name';
+                nameEl.textContent = a.name || a.user_id;
+
+                const idEl = document.createElement('span');
+                idEl.className = 'modal-author-id';
+                idEl.textContent = a.user_id;
+
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'btn-icon-danger';
+                deleteBtn.title = '删除';
+                deleteBtn.textContent = '✕';
+                deleteBtn.addEventListener('click', () => confirmDeleteAuthor(a.user_id, a.name || a.user_id));
+
+                info.appendChild(nameEl);
+                info.appendChild(idEl);
+                item.appendChild(info);
+                item.appendChild(deleteBtn);
+                list.appendChild(item);
+            });
         }
 
         async function addAuthor() {
@@ -376,7 +397,6 @@
         }
 
         async function deleteAuthor(userId) {
-            if (!confirm('确定删除该作者？')) return;
             await fetch(`/api/authors/${userId}`, {method: 'DELETE'});
             showToast('✅ 已删除', 'success');
             await loadData();

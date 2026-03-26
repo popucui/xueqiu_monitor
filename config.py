@@ -19,14 +19,15 @@ POST_COUNT = 10               # 每个作者获取最近多少条
 
 # ==================== 推送通知 ====================
 # 企业微信 Webhook（留空则不推送，仅控制台输出）
-WECHAT_WEBHOOK_URL = ""
+WECHAT_WEBHOOK_URL = os.getenv("WECHAT_WEBHOOK_URL", "")
 # 飞书 Webhook
-FEISHU_WEBHOOK_URL = ""
+FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
 # 钉钉 Webhook
-DINGTALK_WEBHOOK_URL = ""
+DINGTALK_WEBHOOK_URL = os.getenv("DINGTALK_WEBHOOK_URL", "")
 
 # ==================== Web 看板 ====================
 # 安全建议：默认仅监听本机，如需局域网访问可在 .env 中设置 WEB_HOST=0.0.0.0
 WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.getenv("WEB_PORT", "5001"))
+DEBUG = os.getenv("FLASK_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 DB_PATH = "xueqiu_monitor.db"
