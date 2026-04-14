@@ -104,6 +104,9 @@
         let allPosts = [];  // 当前筛选条件下已经懒加载出来的帖子
         let currentFilter = 'all';
         let dbAuthors = [];  // 来自数据库的作者列表（用于管理）
+        let authorSummaryMap = {};
+        let draggedAuthorId = null;
+        let suppressAuthorClick = false;
         let totalAllPosts = 0;
         let currentTotalPosts = 0;
         let postsOffset = 0;
@@ -207,6 +210,15 @@
             }).join('');
         }
 
+        function getEnrichedAuthors() {
+            return dbAuthors.map(a => ({
+                user_id: a.user_id,
+                user_name: a.name,
+                total: authorSummaryMap[a.user_id] ? authorSummaryMap[a.user_id].total : 0,
+                latest_at_fmt: authorSummaryMap[a.user_id] ? authorSummaryMap[a.user_id].latest_at_fmt : '',
+            }));
+        }
+
         // 转义并高亮URL/转发
         function formatText(str) {
             const d = document.createElement('div');
@@ -237,6 +249,7 @@
             const panel = document.getElementById('authorsPanel');
             // 保留 "全部" 卡片
             const allCard = panel.querySelector('[data-author="all"]');
+            allCard.classList.toggle('active', currentFilter === 'all');
             const existingCards = panel.querySelectorAll('[data-author]:not([data-author="all"])');
             existingCards.forEach(c => c.remove());
 
@@ -246,13 +259,47 @@
                 const color = getAuthorColor(a.user_name || '');
                 const card = document.createElement('div');
                 card.className = 'author-card';
+                if (currentFilter === a.user_id) card.classList.add('active');
                 card.dataset.author = a.user_id;
-                card.onclick = function() { filterByAuthor(a.user_id, this); };
+                card.draggable = true;
+                card.title = '拖动调整作者顺序';
+                card.onclick = function() {
+                    if (suppressAuthorClick) return;
+                    filterByAuthor(a.user_id, this);
+                };
+                card.addEventListener('dragstart', e => {
+                    draggedAuthorId = a.user_id;
+                    suppressAuthorClick = true;
+                    card.classList.add('dragging');
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', a.user_id);
+                });
+                card.addEventListener('dragover', e => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    card.classList.add('drag-over');
+                });
+                card.addEventListener('dragleave', () => {
+                    card.classList.remove('drag-over');
+                });
+                card.addEventListener('drop', e => {
+                    e.preventDefault();
+                    card.classList.remove('drag-over');
+                    const sourceId = e.dataTransfer.getData('text/plain') || draggedAuthorId;
+                    const targetRect = card.getBoundingClientRect();
+                    const placeAfter = e.clientY > targetRect.top + targetRect.height / 2;
+                    reorderAuthors(sourceId, a.user_id, placeAfter);
+                });
+                card.addEventListener('dragend', () => {
+                    card.classList.remove('dragging', 'drag-over');
+                    draggedAuthorId = null;
+                    setTimeout(() => { suppressAuthorClick = false; }, 0);
+                });
                 // 使用 DOM API 赋值，避免 XSS
                 const nameDiv = document.createElement('div');
                 nameDiv.className = 'author-name';
                 nameDiv.style.color = color;
-                nameDiv.textContent = a.user_name || a.user_id;
+                nameDiv.innerHTML = `<span class="author-drag-handle">↕</span>${escapeHtml(a.user_name || a.user_id)}`;
                 const metaDiv = document.createElement('div');
                 metaDiv.className = 'author-meta';
                 metaDiv.innerHTML = `<span>${escapeHtml(String(a.total))} 条</span><span>${escapeHtml(a.latest_at_fmt || '')}</span>`;
@@ -260,6 +307,7 @@
                 delBtn.className = 'author-del-btn';
                 delBtn.title = '删除作者';
                 delBtn.textContent = '✕';
+                delBtn.draggable = false;
                 delBtn.onclick = function(e) {
                     e.stopPropagation();
                     confirmDeleteAuthor(a.user_id, a.user_name || a.user_id);
@@ -269,6 +317,40 @@
                 card.appendChild(delBtn);
                 panel.appendChild(card);
             });
+        }
+
+        async function reorderAuthors(sourceId, targetId, placeAfter) {
+            if (!sourceId || !targetId || sourceId === targetId) return;
+            const sourceIndex = dbAuthors.findIndex(a => a.user_id === sourceId);
+            const targetIndex = dbAuthors.findIndex(a => a.user_id === targetId);
+            if (sourceIndex < 0 || targetIndex < 0) return;
+
+            const reordered = dbAuthors.slice();
+            const [moved] = reordered.splice(sourceIndex, 1);
+            let insertIndex = reordered.findIndex(a => a.user_id === targetId);
+            if (placeAfter) insertIndex += 1;
+            reordered.splice(insertIndex, 0, moved);
+
+            dbAuthors = reordered;
+            renderAuthors(getEnrichedAuthors());
+
+            try {
+                const res = await fetch('/api/authors/order', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({user_ids: dbAuthors.map(a => a.user_id)}),
+                });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'ok') {
+                    showToast(`❌ ${data.message || '作者顺序保存失败'}`, 'error');
+                    await loadData();
+                    return;
+                }
+                showToast('✅ 作者顺序已保存', 'success');
+            } catch (e) {
+                showToast('❌ 作者顺序保存失败', 'error');
+                await loadData();
+            }
         }
 
         // 按作者过滤
@@ -358,17 +440,11 @@
                 totalAllPosts = authorsData.total_posts || 0;
 
                 // 构建 user_id -> 统计摘要 的映射
-                const summaryMap = {};
-                (authorsData.authors || []).forEach(s => { summaryMap[s.user_id] = s; });
+                authorSummaryMap = {};
+                (authorsData.authors || []).forEach(s => { authorSummaryMap[s.user_id] = s; });
 
                 // 以 dbAuthors 为主（完整列表），合并统计信息
-                const enrichedAuthors = dbAuthors.map(a => ({
-                    user_id: a.user_id,
-                    user_name: a.name,
-                    total: summaryMap[a.user_id] ? summaryMap[a.user_id].total : 0,
-                    latest_at_fmt: summaryMap[a.user_id] ? summaryMap[a.user_id].latest_at_fmt : '',
-                }));
-                renderAuthors(enrichedAuthors);
+                renderAuthors(getEnrichedAuthors());
 
                 const activeFilter = currentFilter === 'all' || dbAuthors.some(a => a.user_id === currentFilter)
                     ? currentFilter

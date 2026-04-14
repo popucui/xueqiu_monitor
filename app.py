@@ -184,6 +184,22 @@ def api_add_author():
     return jsonify({"status": "error", "message": "作者已存在"}), 409
 
 
+@app.route("/api/authors/order", methods=["PUT"])
+def api_reorder_authors():
+    data = _get_json_payload()
+    if data is None:
+        return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
+    user_ids = data.get("user_ids", [])
+    if not isinstance(user_ids, list) or not user_ids:
+        return jsonify({"status": "error", "message": "user_ids 必须是非空数组"}), 400
+    user_ids = [str(user_id).strip() for user_id in user_ids]
+    if any(not _is_valid_user_id(user_id) for user_id in user_ids):
+        return jsonify({"status": "error", "message": "user_ids 必须均为纯数字"}), 400
+    if not database.update_authors_order(user_ids):
+        return jsonify({"status": "error", "message": "作者顺序保存失败"}), 400
+    return jsonify({"status": "ok"})
+
+
 @app.route("/api/authors/<user_id>", methods=["DELETE"])
 def api_delete_author(user_id):
     if not _is_valid_user_id(user_id):

@@ -37,6 +37,42 @@ class _ConnCtx:
         return False
 
 
+def _ensure_authors_sort_order(conn):
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(authors)").fetchall()
+    }
+    if "sort_order" not in columns:
+        conn.execute("ALTER TABLE authors ADD COLUMN sort_order INTEGER")
+
+    rows = conn.execute(
+        "SELECT user_id, sort_order FROM authors ORDER BY added_at DESC, user_id"
+    ).fetchall()
+    if not any(row["sort_order"] is None for row in rows):
+        return
+
+    if all(row["sort_order"] is None for row in rows):
+        for idx, row in enumerate(rows):
+            conn.execute(
+                "UPDATE authors SET sort_order = ? WHERE user_id = ?",
+                (idx, row["user_id"]),
+            )
+        return
+
+    next_order_row = conn.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM authors"
+    ).fetchone()
+    next_order = int(next_order_row["next_order"])
+    for row in rows:
+        if row["sort_order"] is not None:
+            continue
+        conn.execute(
+            "UPDATE authors SET sort_order = ? WHERE user_id = ?",
+            (next_order, row["user_id"]),
+        )
+        next_order += 1
+
+
 def init_db():
     with _ConnCtx() as conn:
         # WAL 模式只需设置一次（持久化），放在初始化阶段
@@ -75,9 +111,12 @@ def init_db():
             CREATE TABLE IF NOT EXISTS authors (
                 user_id   TEXT PRIMARY KEY,
                 name      TEXT NOT NULL DEFAULT '',
-                added_at  TEXT DEFAULT ''
+                added_at  TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 0
             );
         """)
+        _ensure_authors_sort_order(conn)
+        conn.commit()
 
 
 def save_posts(posts: list) -> list:
@@ -171,7 +210,9 @@ def get_db_authors() -> list:
     """从数据库获取作者列表"""
     with _ConnCtx() as conn:
         rows = conn.execute(
-            "SELECT user_id, name, added_at FROM authors ORDER BY added_at DESC"
+            """SELECT user_id, name, added_at, sort_order
+               FROM authors
+               ORDER BY sort_order ASC, added_at DESC"""
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -182,10 +223,16 @@ def add_author(user_id: str, name: str) -> bool:
         return False
     now = datetime.now().isoformat()
     with _ConnCtx() as conn:
+        order_row = conn.execute(
+            "SELECT MIN(sort_order) AS min_order FROM authors"
+        ).fetchone()
+        min_order = order_row["min_order"]
+        sort_order = 0 if min_order is None else int(min_order) - 1
         try:
             conn.execute(
-                "INSERT INTO authors (user_id, name, added_at) VALUES (?, ?, ?)",
-                (str(user_id), name.strip(), now),
+                """INSERT INTO authors (user_id, name, added_at, sort_order)
+                   VALUES (?, ?, ?, ?)""",
+                (str(user_id), name.strip(), now, sort_order),
             )
             conn.commit()
             return True
@@ -212,6 +259,33 @@ def update_author(user_id: str, name: str) -> bool:
             "UPDATE authors SET name = ? WHERE user_id = ?",
             (name.strip(), str(user_id)),
         )
+        conn.commit()
+    return True
+
+
+def update_authors_order(user_ids: list) -> bool:
+    """按传入 user_id 顺序持久化作者列表排序"""
+    ordered_ids = [str(user_id) for user_id in user_ids if str(user_id)]
+    if len(ordered_ids) != len(set(ordered_ids)):
+        return False
+
+    with _ConnCtx() as conn:
+        current_rows = conn.execute(
+            "SELECT user_id FROM authors ORDER BY sort_order ASC, added_at DESC"
+        ).fetchall()
+        current_ids = [row["user_id"] for row in current_rows]
+        current_set = set(current_ids)
+        if any(user_id not in current_set for user_id in ordered_ids):
+            return False
+
+        final_ids = ordered_ids + [
+            user_id for user_id in current_ids if user_id not in set(ordered_ids)
+        ]
+        for idx, user_id in enumerate(final_ids):
+            conn.execute(
+                "UPDATE authors SET sort_order = ? WHERE user_id = ?",
+                (idx, user_id),
+            )
         conn.commit()
     return True
 
@@ -260,5 +334,4 @@ def get_price_history(symbol: str, limit: int = 30) -> list:
             (symbol, limit),
         ).fetchall()
     return [dict(r) for r in rows]
-
 
