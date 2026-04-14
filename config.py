@@ -31,6 +31,11 @@ DINGTALK_WEBHOOK_URL = os.getenv("DINGTALK_WEBHOOK_URL", "")
 PRICE_REPORT_HOUR   = int(os.getenv("PRICE_REPORT_HOUR",   "8"))
 PRICE_REPORT_MINUTE = int(os.getenv("PRICE_REPORT_MINUTE", "30"))
 
+# ==================== 公告追踪 ====================
+ANNOUNCEMENT_LOOKBACK_DAYS = int(os.getenv("ANNOUNCEMENT_LOOKBACK_DAYS", "30"))
+ANNOUNCEMENT_FETCH_PAGE_SIZE = int(os.getenv("ANNOUNCEMENT_FETCH_PAGE_SIZE", "50"))
+ANNOUNCEMENT_FETCH_INTERVAL_MINUTES = int(os.getenv("ANNOUNCEMENT_FETCH_INTERVAL_MINUTES", "60"))
+
 # ==================== Web 看板 ====================
 # 安全建议：默认仅监听本机，如需局域网访问可在 .env 中设置 WEB_HOST=0.0.0.0
 WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")

@@ -92,6 +92,25 @@ body::before {
     color: var(--text-muted);
 }
 
+.nav-link,
+.price-bar-link {
+    color: var(--accent-cyan);
+    text-decoration: none;
+    border: 1px solid rgba(6, 182, 212, 0.25);
+    background: rgba(6, 182, 212, 0.08);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.nav-link:hover,
+.price-bar-link:hover {
+    background: rgba(6, 182, 212, 0.16);
+    border-color: rgba(6, 182, 212, 0.45);
+}
+
 .btn-refresh {
     padding: 8px 20px;
     border: 1px solid rgba(6, 182, 212, 0.3);
@@ -622,6 +641,16 @@ body::before {
     outline: none;
     transition: border-color 0.2s;
 }
+.add-author-form select {
+    padding: 10px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+}
 .add-author-form input:focus {
     border-color: rgba(6, 182, 212, 0.4);
 }
@@ -641,6 +670,20 @@ body::before {
 }
 .btn-add-author:hover {
     background: rgba(6, 182, 212, 0.25);
+}
+
+.btn-delete-author {
+    background: rgba(244, 63, 94, 0.08);
+    border: 1px solid rgba(244, 63, 94, 0.24);
+    color: var(--accent-rose);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 6px 10px;
+}
+
+.btn-delete-author:hover {
+    background: rgba(244, 63, 94, 0.16);
 }
 
 /* ===== 作者卡片删除按钮 ===== */
@@ -780,3 +823,87 @@ body::before {
     transition: color 0.2s;
 }
 .btn-price-refresh:hover { color: var(--accent-cyan); }
+
+/* ==================== 公告追踪 ==================== */
+.announcements-toolbar {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 18px;
+}
+
+.announcements-subtitle {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin-top: 4px;
+}
+
+.announcement-filter {
+    min-width: 180px;
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    font-size: 14px;
+}
+
+.announcement-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 16px 18px;
+    margin-bottom: 12px;
+}
+
+.announcement-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    color: var(--text-muted);
+    font-size: 12px;
+    margin-bottom: 8px;
+}
+
+.announcement-title {
+    font-size: 16px;
+    line-height: 1.5;
+    margin: 0 0 10px;
+    font-weight: 600;
+}
+
+.announcement-title a {
+    color: var(--text-primary);
+    text-decoration: none;
+}
+
+.announcement-title a:hover {
+    color: var(--accent-cyan);
+}
+
+.announcement-keywords {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 3px 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.announcement-keywords.matched {
+    color: var(--accent-gold);
+    border-color: rgba(245, 158, 11, 0.35);
+    background: rgba(245, 158, 11, 0.08);
+}
+
+@media (max-width: 768px) {
+    .announcements-toolbar {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .announcement-filter {
+        width: 100%;
+    }
+}

@@ -8,18 +8,22 @@ from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 
 import config
+import announcements
 import database
 from fetcher import XueqiuFetcher
 from notifier import notify_new_posts, notify_prices
 from price_fetcher import fetch_prices
-from scheduler import start_scheduler, start_price_scheduler
+from scheduler import start_scheduler, start_price_scheduler, start_announcement_scheduler
 
 app = Flask(__name__)
 
 # 全局状态
 _last_fetch_time = None
+_last_announcement_fetch_time = None
 _fetch_lock = threading.Lock()
+_announcement_fetch_lock = threading.Lock()
 _USER_ID_RE = re.compile(r"^\d{1,32}$")
+_ANNOUNCEMENT_CODE_RE = re.compile(r"^\d{5}\.HK$|^\d{6}\.(SH|SZ|BJ)$")
 
 
 def _is_valid_user_id(user_id: str) -> bool:
@@ -247,6 +251,37 @@ def do_fetch_prices():
         return {"status": "error", "message": str(e)}
 
 
+def do_fetch_announcements():
+    """执行一次公告抓取"""
+    global _last_announcement_fetch_time
+    if not _announcement_fetch_lock.acquire(blocking=False):
+        print("⏳ 上一次公告抓取尚未完成，跳过")
+        return {"status": "skipped", "reason": "already running"}
+
+    try:
+        watchlist = database.get_announcement_watchlist()
+        rows = announcements.fetch_for_watchlist(
+            watchlist,
+            days_back=config.ANNOUNCEMENT_LOOKBACK_DAYS,
+            page_size=config.ANNOUNCEMENT_FETCH_PAGE_SIZE,
+        )
+        new_rows = database.save_announcements(rows)
+        _last_announcement_fetch_time = datetime.now().isoformat()
+        return {
+            "status": "ok",
+            "total_fetched": len(rows),
+            "new_announcements": len(new_rows),
+            "lookback_days": config.ANNOUNCEMENT_LOOKBACK_DAYS,
+            "time": _last_announcement_fetch_time,
+        }
+    except Exception as e:
+        print(f"❌ 公告抓取失败: {e}")
+        import traceback; traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+    finally:
+        _announcement_fetch_lock.release()
+
+
 @app.route("/api/prices")
 def api_prices():
     """返回最新一次各品种价格"""
@@ -271,6 +306,86 @@ def api_prices_refresh():
     return jsonify(result)
 
 
+# ==================== 公告追踪 ====================
+
+@app.route("/announcements")
+def announcements_page():
+    return render_template("announcements.html")
+
+
+@app.route("/api/announcements")
+def api_announcements():
+    stock_code = request.args.get("stock_code", "").strip().upper() or None
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 500))
+    except (ValueError, TypeError):
+        limit = 100
+    rows = database.get_recent_announcements(limit, stock_code)
+    return jsonify({
+        "announcements": rows,
+        "summary": database.get_announcements_summary(),
+        "watchlist": database.get_announcement_watchlist(),
+        "last_fetch": _last_announcement_fetch_time or database.get_latest_announcement_fetch_time(),
+    })
+
+
+@app.route("/api/announcements/refresh", methods=["POST"])
+def api_announcements_refresh():
+    result = do_fetch_announcements()
+    return jsonify(result)
+
+
+@app.route("/api/announcement-stocks", methods=["GET"])
+def api_announcement_stocks():
+    return jsonify({"stocks": database.get_announcement_watchlist()})
+
+
+@app.route("/api/announcement-stocks", methods=["POST"])
+def api_add_announcement_stock():
+    data = _get_json_payload()
+    if data is None:
+        return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
+    code = str(data.get("code", "")).strip().upper()
+    name = str(data.get("name", "")).strip()
+    source = str(data.get("source", "")).strip().lower()
+    if not code or not name or not source:
+        return jsonify({"status": "error", "message": "代码、名称、来源不能为空"}), 400
+    if not _ANNOUNCEMENT_CODE_RE.fullmatch(code):
+        return jsonify({"status": "error", "message": "代码格式应为 02400.HK 或 601919.SH"}), 400
+    if source not in {"hkex", "cninfo"}:
+        return jsonify({"status": "error", "message": "来源只能是 hkex 或 cninfo"}), 400
+    if source == "hkex" and not code.endswith(".HK"):
+        return jsonify({"status": "error", "message": "港股请使用 hkex 来源"}), 400
+    if source == "cninfo" and code.endswith(".HK"):
+        return jsonify({"status": "error", "message": "A 股请使用 cninfo 来源"}), 400
+    keywords = data.get("keywords")
+    if isinstance(keywords, str):
+        keywords = [item.strip() for item in keywords.split(",") if item.strip()]
+    elif keywords is not None and not isinstance(keywords, list):
+        return jsonify({"status": "error", "message": "keywords 必须是数组或逗号分隔字符串"}), 400
+
+    ok = database.add_announcement_stock(
+        code,
+        name,
+        source,
+        keywords=keywords,
+        org_id=str(data.get("org_id", "")).strip(),
+        stock_id=str(data.get("stock_id", "")).strip(),
+    )
+    if ok:
+        return jsonify({"status": "ok", "code": code, "name": name, "source": source})
+    return jsonify({"status": "error", "message": "关注公司已存在或参数无效"}), 409
+
+
+@app.route("/api/announcement-stocks/<path:code>", methods=["DELETE"])
+def api_delete_announcement_stock(code):
+    code = str(code or "").strip().upper()
+    if not _ANNOUNCEMENT_CODE_RE.fullmatch(code):
+        return jsonify({"status": "error", "message": "代码格式非法"}), 400
+    database.delete_announcement_stock(code)
+    return jsonify({"status": "ok"})
+
+
 # ==================== 启动 ====================
 
 if __name__ == "__main__":
@@ -286,6 +401,10 @@ if __name__ == "__main__":
         start_price_scheduler(do_fetch_prices,
                               hour=config.PRICE_REPORT_HOUR,
                               minute=config.PRICE_REPORT_MINUTE)
+        start_announcement_scheduler(
+            do_fetch_announcements,
+            config.ANNOUNCEMENT_FETCH_INTERVAL_MINUTES,
+        )
     else:
         print("🔁 Reloader 子进程已启动")
 

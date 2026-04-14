@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>公告追踪</title>
+    <meta name="description" content="关注股票公告追踪">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="navbar-brand">
+            <div class="icon">📣</div>
+            <span>公告追踪</span>
+        </div>
+        <div class="navbar-actions">
+            <a class="nav-link" href="/">返回雪球动态</a>
+            <span class="last-update" id="lastUpdate">加载中...</span>
+            <button class="btn-edit-authors" onclick="openStockModal()">
+                <span class="label">⚙️ 管理公司</span>
+            </button>
+            <button class="btn-refresh" id="btnRefresh" onclick="refreshAnnouncements()">
+                <span class="spinner"></span>
+                <span class="label">🔄 手动刷新</span>
+            </button>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="announcements-toolbar">
+            <div>
+                <h1 class="posts-title">公告结果</h1>
+                <div class="announcements-subtitle">先保留所有公告，跑一段时间后再调整过滤规则。</div>
+            </div>
+            <select id="stockFilter" class="announcement-filter" onchange="loadAnnouncements()">
+                <option value="">全部股票</option>
+            </select>
+        </div>
+        <div id="announcementsList">
+            <div class="empty-state">
+                <div class="icon">📡</div>
+                <p>正在加载公告...</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <div class="modal-overlay" id="stockModal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2>管理关注公司</h2>
+                <button class="modal-close" onclick="closeStockModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-section-title">当前公司</div>
+                <div id="modalStockList"></div>
+                <div class="modal-divider"></div>
+                <div class="modal-section-title">添加新公司</div>
+                <div class="add-author-form announcement-stock-form">
+                    <input type="text" id="newStockCode" placeholder="股票代码，如 00700.HK 或 600519.SH" />
+                    <input type="text" id="newStockName" placeholder="公司名称，如 腾讯控股" />
+                    <select id="newStockSource" class="announcement-source-select">
+                        <option value="hkex">港股 / HKEX</option>
+                        <option value="cninfo">A 股 / 巨潮</option>
+                    </select>
+                    <input type="text" id="newStockKeywords" placeholder="关键词，可选，逗号分隔；留空使用默认" />
+                    <button class="btn-add-author" onclick="addStock()">添加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentWatchlist = [];
+
+        function escapeHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast show ${type}`;
+            setTimeout(() => { toast.className = 'toast'; }, 2500);
+        }
+
+        async function loadAnnouncements() {
+            const stockCode = document.getElementById('stockFilter').value;
+            const params = new URLSearchParams({limit: '200'});
+            if (stockCode) params.set('stock_code', stockCode);
+            const res = await fetch(`/api/announcements?${params}`);
+            const data = await res.json();
+            renderWatchlist(data.watchlist || []);
+            renderModalStocks(data.watchlist || []);
+            renderAnnouncements(data.announcements || []);
+            const last = data.last_fetch ? new Date(data.last_fetch).toLocaleString('zh-CN') : '尚未刷新';
+            document.getElementById('lastUpdate').textContent = `公告刷新：${last}`;
+        }
+
+        function renderWatchlist(watchlist) {
+            currentWatchlist = watchlist;
+            const select = document.getElementById('stockFilter');
+            const selected = select.value;
+            select.innerHTML = '<option value="">全部股票</option>' + watchlist.map(item => (
+                `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)} ${escapeHtml(item.code)}</option>`
+            )).join('');
+            select.value = selected;
+        }
+
+        function renderModalStocks(watchlist) {
+            const container = document.getElementById('modalStockList');
+            if (!watchlist.length) {
+                container.innerHTML = '<div class="empty-state"><p>暂无关注公司</p></div>';
+                return;
+            }
+            container.innerHTML = watchlist.map(item => `
+                <div class="modal-author-item">
+                    <div>
+                        <div class="modal-author-name">${escapeHtml(item.name)} ${escapeHtml(item.code)}</div>
+                        <div class="modal-author-meta">${escapeHtml(item.source)} · ${escapeHtml((item.keywords || []).join(', ') || '默认关键词')}</div>
+                    </div>
+                    <button class="btn-delete-author" onclick="deleteStock('${escapeHtml(item.code)}', '${escapeHtml(item.name)}')">删除</button>
+                </div>
+            `).join('');
+        }
+
+        function renderAnnouncements(rows) {
+            const container = document.getElementById('announcementsList');
+            if (!rows.length) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">📭</div>
+                        <p>暂无公告。点击手动刷新获取最新数据。</p>
+                    </div>`;
+                return;
+            }
+            container.innerHTML = rows.map(row => {
+                const keywords = row.matched_keywords || '未命中';
+                const keywordClass = row.matched_keywords ? 'matched' : '';
+                const safeUrl = (row.url || '').startsWith('http') ? row.url : '';
+                const title = escapeHtml(row.title || '');
+                return `
+                    <article class="announcement-card">
+                        <div class="announcement-meta">
+                            <span>${escapeHtml(row.stock_name || '')} ${escapeHtml(row.stock_code || '')}</span>
+                            <span>${escapeHtml(row.published_at || '')}</span>
+                            <span>${escapeHtml(row.source || '')}</span>
+                        </div>
+                        <h2 class="announcement-title">
+                            ${safeUrl ? `<a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${title}</a>` : title}
+                        </h2>
+                        <div class="announcement-keywords ${keywordClass}">关键词：${escapeHtml(keywords)}</div>
+                    </article>`;
+            }).join('');
+        }
+
+        async function refreshAnnouncements() {
+            const btn = document.getElementById('btnRefresh');
+            btn.disabled = true;
+            btn.classList.add('loading');
+            try {
+                const res = await fetch('/api/announcements/refresh', {method: 'POST'});
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    showToast(`✅ 公告已更新：新增 ${data.new_announcements || 0} 条`, 'success');
+                    await loadAnnouncements();
+                } else {
+                    showToast(`❌ ${data.message || '公告刷新失败'}`, 'error');
+                }
+            } catch (e) {
+                showToast('❌ 公告刷新失败', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('loading');
+            }
+        }
+
+        function openStockModal() {
+            renderModalStocks(currentWatchlist);
+            document.getElementById('stockModal').classList.add('show');
+        }
+
+        function closeStockModal() {
+            document.getElementById('stockModal').classList.remove('show');
+        }
+
+        function inferSourceFromCode(code) {
+            if (code.endsWith('.HK')) return 'hkex';
+            return 'cninfo';
+        }
+
+        document.getElementById('newStockCode').addEventListener('input', e => {
+            const code = e.target.value.trim().toUpperCase();
+            if (code.endsWith('.HK') || code.endsWith('.SH') || code.endsWith('.SZ') || code.endsWith('.BJ')) {
+                document.getElementById('newStockSource').value = inferSourceFromCode(code);
+            }
+        });
+
+        async function addStock() {
+            const codeEl = document.getElementById('newStockCode');
+            const nameEl = document.getElementById('newStockName');
+            const sourceEl = document.getElementById('newStockSource');
+            const keywordsEl = document.getElementById('newStockKeywords');
+            const payload = {
+                code: codeEl.value.trim().toUpperCase(),
+                name: nameEl.value.trim(),
+                source: sourceEl.value,
+                keywords: keywordsEl.value.trim(),
+            };
+            if (!payload.code || !payload.name) {
+                showToast('❌ 请填写股票代码和公司名称', 'error');
+                return;
+            }
+            const res = await fetch('/api/announcement-stocks', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast('✅ 已添加关注公司', 'success');
+                codeEl.value = '';
+                nameEl.value = '';
+                keywordsEl.value = '';
+                await loadAnnouncements();
+            } else {
+                showToast(`❌ ${data.message || '添加失败'}`, 'error');
+            }
+        }
+
+        async function deleteStock(code, name) {
+            if (!confirm(`确定删除「${name} ${code}」？历史公告会保留。`)) return;
+            const res = await fetch(`/api/announcement-stocks/${encodeURIComponent(code)}`, {method: 'DELETE'});
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast('✅ 已删除关注公司', 'success');
+                if (document.getElementById('stockFilter').value === code) {
+                    document.getElementById('stockFilter').value = '';
+                }
+                await loadAnnouncements();
+            } else {
+                showToast(`❌ ${data.message || '删除失败'}`, 'error');
+            }
+        }
+
+        loadAnnouncements();
+    </script>
+</body>
+</html>

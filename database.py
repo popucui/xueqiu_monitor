@@ -114,9 +114,75 @@ def init_db():
                 added_at  TEXT DEFAULT '',
                 sort_order INTEGER DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS announcement_watchlist (
+                code       TEXT PRIMARY KEY,
+                name       TEXT NOT NULL DEFAULT '',
+                source     TEXT NOT NULL DEFAULT '',
+                org_id     TEXT DEFAULT '',
+                stock_id   TEXT DEFAULT '',
+                keywords   TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 0,
+                added_at   TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS announcements (
+                source           TEXT NOT NULL,
+                ann_id           TEXT NOT NULL,
+                stock_code       TEXT NOT NULL,
+                stock_name       TEXT NOT NULL DEFAULT '',
+                title            TEXT NOT NULL DEFAULT '',
+                published_at     TEXT DEFAULT '',
+                url              TEXT DEFAULT '',
+                matched_keywords TEXT DEFAULT '',
+                fetched_at       TEXT DEFAULT '',
+                first_seen_at    TEXT DEFAULT '',
+                PRIMARY KEY (source, ann_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_announcements_stock ON announcements(stock_code);
+            CREATE INDEX IF NOT EXISTS idx_announcements_time ON announcements(published_at DESC);
         """)
         _ensure_authors_sort_order(conn)
+        _ensure_default_announcement_watchlist(conn)
         conn.commit()
+
+
+def _ensure_default_announcement_watchlist(conn):
+    rows = conn.execute(
+        "SELECT COUNT(*) AS total FROM announcement_watchlist"
+    ).fetchone()
+    if int(rows["total"] or 0) > 0:
+        return
+
+    now = datetime.now().isoformat()
+    defaults = [
+        (
+            "02400.HK",
+            "心动公司",
+            "hkex",
+            "",
+            "1000016859",
+            "Annual Results,Interim Results,Quarterly,Monthly Return,Results Announcement,年报,中期,季度,月报",
+            0,
+            now,
+        ),
+        (
+            "601919.SH",
+            "中远海控",
+            "cninfo",
+            "9900003201",
+            "",
+            "年度报告,半年度报告,季度报告,业绩,主要经营数据,经营简报,月报,证券变动月报表",
+            1,
+            now,
+        ),
+    ]
+    conn.executemany(
+        """INSERT OR IGNORE INTO announcement_watchlist
+           (code, name, source, org_id, stock_id, keywords, sort_order, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        defaults,
+    )
 
 
 def save_posts(posts: list) -> list:
@@ -335,3 +401,188 @@ def get_price_history(symbol: str, limit: int = 30) -> list:
         ).fetchall()
     return [dict(r) for r in rows]
 
+
+# ==================== 公告追踪 ====================
+
+def get_announcement_watchlist() -> list:
+    """返回公告关注股票列表"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT code, name, source, org_id, stock_id, keywords, sort_order, added_at
+               FROM announcement_watchlist
+               ORDER BY sort_order ASC, code ASC"""
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["keywords"] = [
+            keyword.strip()
+            for keyword in (item.get("keywords") or "").split(",")
+            if keyword.strip()
+        ]
+        item["org_id"] = item.get("org_id") or None
+        item["stock_id"] = item.get("stock_id") or None
+        result.append(item)
+    return result
+
+
+def _keywords_to_text(keywords) -> str:
+    if isinstance(keywords, str):
+        return ",".join(keyword.strip() for keyword in keywords.split(",") if keyword.strip())
+    if isinstance(keywords, list):
+        return ",".join(str(keyword).strip() for keyword in keywords if str(keyword).strip())
+    return ""
+
+
+def add_announcement_stock(
+    code: str,
+    name: str,
+    source: str,
+    keywords=None,
+    org_id: str = "",
+    stock_id: str = "",
+) -> bool:
+    """添加公告关注股票，成功返回 True，已存在返回 False"""
+    code = (code or "").strip().upper()
+    name = (name or "").strip()
+    source = (source or "").strip().lower()
+    if not code or not name or source not in {"hkex", "cninfo"}:
+        return False
+
+    if keywords is None:
+        if source == "hkex":
+            keywords = [
+                "Annual Results", "Interim Results", "Quarterly", "Monthly Return",
+                "Results Announcement", "年报", "中期", "季度", "月报",
+            ]
+        else:
+            keywords = [
+                "年度报告", "半年度报告", "季度报告", "业绩",
+                "主要经营数据", "经营简报", "月报",
+            ]
+    keywords_text = _keywords_to_text(keywords)
+    now = datetime.now().isoformat()
+    with _ConnCtx() as conn:
+        order_row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM announcement_watchlist"
+        ).fetchone()
+        try:
+            conn.execute(
+                """INSERT INTO announcement_watchlist
+                   (code, name, source, org_id, stock_id, keywords, sort_order, added_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    code,
+                    name,
+                    source,
+                    (org_id or "").strip(),
+                    (stock_id or "").strip(),
+                    keywords_text,
+                    int(order_row["next_order"]),
+                    now,
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def delete_announcement_stock(code: str) -> bool:
+    """删除公告关注股票。历史公告保留，返回 True。"""
+    code = (code or "").strip().upper()
+    if not code:
+        return False
+    with _ConnCtx() as conn:
+        conn.execute("DELETE FROM announcement_watchlist WHERE code = ?", (code,))
+        conn.commit()
+    return True
+
+
+def save_announcements(announcements: list) -> list:
+    """保存公告列表，返回新增公告"""
+    if not announcements:
+        return []
+    new_rows = []
+    now = datetime.now().isoformat()
+    with _ConnCtx() as conn:
+        for ann in announcements:
+            source = ann.source
+            ann_id = ann.ann_id
+            existing = conn.execute(
+                "SELECT 1 FROM announcements WHERE source = ? AND ann_id = ?",
+                (source, ann_id),
+            ).fetchone()
+            first_seen_at = now if existing is None else None
+            conn.execute(
+                """INSERT INTO announcements
+                   (source, ann_id, stock_code, stock_name, title, published_at, url,
+                    matched_keywords, fetched_at, first_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source, ann_id) DO UPDATE SET
+                       stock_code = excluded.stock_code,
+                       stock_name = excluded.stock_name,
+                       title = excluded.title,
+                       published_at = excluded.published_at,
+                       url = excluded.url,
+                       matched_keywords = excluded.matched_keywords,
+                       fetched_at = excluded.fetched_at""",
+                (
+                    source,
+                    ann_id,
+                    ann.stock_code,
+                    ann.stock_name,
+                    ann.title,
+                    ann.published_at,
+                    ann.url,
+                    ann.matched_keywords,
+                    now,
+                    first_seen_at or now,
+                ),
+            )
+            if existing is None:
+                new_rows.append(ann)
+        conn.commit()
+    return new_rows
+
+
+def get_recent_announcements(limit: int = 100, stock_code: str = None) -> list:
+    with _ConnCtx() as conn:
+        if stock_code:
+            rows = conn.execute(
+                """SELECT * FROM announcements
+                   WHERE stock_code = ?
+                   ORDER BY published_at DESC, source ASC, ann_id DESC
+                   LIMIT ?""",
+                (stock_code, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM announcements
+                   ORDER BY published_at DESC, source ASC, ann_id DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_announcements_summary() -> list:
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT stock_code,
+                      MAX(stock_name) AS stock_name,
+                      COUNT(*) AS total,
+                      MAX(published_at) AS latest_at
+               FROM announcements
+               GROUP BY stock_code
+               ORDER BY latest_at DESC"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_latest_announcement_fetch_time() -> str:
+    with _ConnCtx() as conn:
+        row = conn.execute(
+            "SELECT MAX(fetched_at) AS latest_fetch FROM announcements"
+        ).fetchone()
+    return row["latest_fetch"] or ""
