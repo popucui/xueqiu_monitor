@@ -27,6 +27,15 @@
         </div>
     </nav>
 
+    <!-- 行情速报栏 -->
+    <div class="price-bar" id="priceBar">
+        <div class="price-bar-title">📈 早盘行情</div>
+        <div class="price-cards" id="priceCards">
+            <span class="price-loading">加载中...</span>
+        </div>
+        <button class="btn-price-refresh" title="刷新行情" onclick="refreshPrices()">↺</button>
+    </div>
+
     <!-- 主内容 -->
     <div class="container">
         <div class="layout">
@@ -53,6 +62,7 @@
                         <p>正在加载数据...</p>
                     </div>
                 </div>
+                <div class="posts-loader" id="postsLoader"></div>
             </main>
         </div>
     </div>
@@ -91,9 +101,17 @@
     </div>
 
     <script>
-        let allPosts = [];
+        let allPosts = [];  // 当前筛选条件下已经懒加载出来的帖子
         let currentFilter = 'all';
         let dbAuthors = [];  // 来自数据库的作者列表（用于管理）
+        let totalAllPosts = 0;
+        let currentTotalPosts = 0;
+        let postsOffset = 0;
+        let postsHasMore = false;
+        let postsLoading = false;
+        let postsRequestToken = 0;
+        let postsObserver = null;
+        const POSTS_PAGE_SIZE = 30;
         const COLORS = ['#f59e0b', '#06b6d4', '#10b981', '#f43f5e', '#8b5cf6', '#ec4899', '#14b8a6'];
 
         // XSS 防护：转义 HTML 特殊字符
@@ -115,11 +133,36 @@
             return COLORS[Math.abs(h) % COLORS.length];
         }
 
+        function updatePostsCount() {
+            const countEl = document.getElementById('postsCount');
+            if (postsLoading && !allPosts.length) {
+                countEl.textContent = '加载中...';
+                return;
+            }
+            if (currentTotalPosts && allPosts.length < currentTotalPosts) {
+                countEl.textContent = `${allPosts.length} / ${currentTotalPosts} 条`;
+                return;
+            }
+            countEl.textContent = `${currentTotalPosts || allPosts.length} 条`;
+        }
+
+        function renderPostsPlaceholder(text) {
+            document.getElementById('postsList').innerHTML = `
+                <div class="empty-state">
+                    <div class="icon">📡</div>
+                    <p>${escapeHtml(text)}</p>
+                </div>`;
+            updatePostsCount();
+        }
+
+        function renderPostsLoader(text) {
+            document.getElementById('postsLoader').textContent = text || '';
+        }
+
         // 渲染帖子列表
         function renderPosts(posts) {
             const container = document.getElementById('postsList');
-            const countEl = document.getElementById('postsCount');
-            countEl.textContent = `${posts.length} 条`;
+            updatePostsCount();
 
             if (!posts.length) {
                 container.innerHTML = `
@@ -197,7 +240,7 @@
             const existingCards = panel.querySelectorAll('[data-author]:not([data-author="all"])');
             existingCards.forEach(c => c.remove());
 
-            document.getElementById('totalPosts').textContent = `${allPosts.length} 条`;
+            document.getElementById('totalPosts').textContent = `${totalAllPosts} 条`;
 
             authors.forEach(a => {
                 const color = getAuthorColor(a.user_name || '');
@@ -230,6 +273,15 @@
 
         // 按作者过滤
         function filterByAuthor(authorId, el) {
+            resetPosts(authorId, el);
+        }
+
+        function getAuthorName(authorId) {
+            const author = dbAuthors.find(a => a.user_id === authorId);
+            return author ? author.name : authorId;
+        }
+
+        async function resetPosts(authorId, el) {
             currentFilter = authorId;
             // 更新 active 状态
             document.querySelectorAll('.author-card').forEach(c => c.classList.remove('active'));
@@ -238,27 +290,72 @@
             const titleEl = document.getElementById('postsTitle');
             if (authorId === 'all') {
                 titleEl.textContent = '全部动态';
-                renderPosts(allPosts);
             } else {
-                const filtered = allPosts.filter(p => p.user_id === authorId);
-                const name = filtered.length ? filtered[0].user_name : authorId;
-                titleEl.textContent = `${name} 的动态`;
-                renderPosts(filtered);
+                titleEl.textContent = `${getAuthorName(authorId)} 的动态`;
+            }
+
+            allPosts = [];
+            currentTotalPosts = 0;
+            postsOffset = 0;
+            postsHasMore = true;
+            postsLoading = false;
+            postsRequestToken += 1;
+            renderPostsLoader('');
+            renderPostsPlaceholder('正在加载数据...');
+            await loadMorePosts(postsRequestToken);
+        }
+
+        async function loadMorePosts(token = postsRequestToken) {
+            if (postsLoading || !postsHasMore) return;
+            postsLoading = true;
+            updatePostsCount();
+            renderPostsLoader('正在加载更多动态...');
+
+            const params = new URLSearchParams({
+                limit: String(POSTS_PAGE_SIZE),
+                offset: String(postsOffset),
+            });
+            if (currentFilter !== 'all') {
+                params.set('author_id', currentFilter);
+            }
+
+            try {
+                const res = await fetch(`/api/posts?${params.toString()}`);
+                const data = await res.json();
+                if (token !== postsRequestToken) return;
+
+                const newPosts = data.posts || [];
+                allPosts = allPosts.concat(newPosts);
+                postsOffset = data.next_offset == null ? allPosts.length : data.next_offset;
+                postsHasMore = Boolean(data.has_more);
+                currentTotalPosts = data.total == null ? allPosts.length : data.total;
+                renderPosts(allPosts);
+
+                if (data.last_fetch) {
+                    document.getElementById('lastUpdate').textContent = `最近更新: ${data.last_fetch.replace('T', ' ').substring(0, 19)}`;
+                }
+                renderPostsLoader(postsHasMore ? '向下滚动加载更多' : (allPosts.length ? '已加载全部动态' : ''));
+            } catch (e) {
+                if (token === postsRequestToken) {
+                    console.error('帖子加载失败:', e);
+                    renderPostsLoader('加载失败，请稍后重试');
+                }
+            } finally {
+                if (token === postsRequestToken) {
+                    postsLoading = false;
+                    updatePostsCount();
+                }
             }
         }
 
         // 加载数据
         async function loadData() {
             try {
-                const [postsRes, authorsRes] = await Promise.all([
-                    fetch('/api/posts?limit=100'),
-                    fetch('/api/authors')
-                ]);
-                const postsData = await postsRes.json();
+                const authorsRes = await fetch('/api/authors');
                 const authorsData = await authorsRes.json();
 
-                allPosts = postsData.posts || [];
                 dbAuthors = authorsData.db_authors || [];
+                totalAllPosts = authorsData.total_posts || 0;
 
                 // 构建 user_id -> 统计摘要 的映射
                 const summaryMap = {};
@@ -272,12 +369,11 @@
                     latest_at_fmt: summaryMap[a.user_id] ? summaryMap[a.user_id].latest_at_fmt : '',
                 }));
                 renderAuthors(enrichedAuthors);
-                filterByAuthor(currentFilter, document.querySelector(`[data-author="${currentFilter}"]`));
 
-                // 更新时间
-                if (postsData.last_fetch) {
-                    document.getElementById('lastUpdate').textContent = `最近更新: ${postsData.last_fetch.replace('T', ' ').substring(0, 19)}`;
-                }
+                const activeFilter = currentFilter === 'all' || dbAuthors.some(a => a.user_id === currentFilter)
+                    ? currentFilter
+                    : 'all';
+                await resetPosts(activeFilter, document.querySelector(`[data-author="${activeFilter}"]`));
             } catch (e) {
                 console.error('加载失败:', e);
             }
@@ -398,6 +494,7 @@
 
         async function deleteAuthor(userId) {
             await fetch(`/api/authors/${userId}`, {method: 'DELETE'});
+            if (currentFilter === userId) currentFilter = 'all';
             showToast('✅ 已删除', 'success');
             await loadData();
             renderModalAuthors();
@@ -408,10 +505,82 @@
             deleteAuthor(userId);
         }
 
+        function setupLazyLoader() {
+            const loader = document.getElementById('postsLoader');
+            if ('IntersectionObserver' in window) {
+                postsObserver = new IntersectionObserver(entries => {
+                    if (entries.some(entry => entry.isIntersecting)) {
+                        loadMorePosts();
+                    }
+                }, { rootMargin: '320px 0px' });
+                postsObserver.observe(loader);
+                return;
+            }
+
+            window.addEventListener('scroll', () => {
+                const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 320;
+                if (nearBottom) loadMorePosts();
+            });
+        }
+
         // 初始化
+        setupLazyLoader();
         loadData();
+        loadPrices();
         // 每 5 分钟自动刷新前端数据
         setInterval(loadData, 5 * 60 * 1000);
+        // 每 10 分钟刷新行情
+        setInterval(loadPrices, 10 * 60 * 1000);
+
+        // ===== 行情速报 =====
+        async function loadPrices() {
+            try {
+                const res = await fetch('/api/prices');
+                const data = await res.json();
+                renderPrices(data.prices || []);
+            } catch(e) {
+                document.getElementById('priceCards').innerHTML =
+                    '<span class="price-loading">行情加载失败</span>';
+            }
+        }
+
+        async function refreshPrices() {
+            const btn = document.querySelector('.btn-price-refresh');
+            btn.disabled = true;
+            btn.textContent = '…';
+            try {
+                await fetch('/api/prices/refresh', {method: 'POST'});
+                await loadPrices();
+                showToast('✅ 行情已更新', 'success');
+            } catch(e) {
+                showToast('❌ 行情刷新失败', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '↺';
+            }
+        }
+
+        function renderPrices(rows) {
+            const container = document.getElementById('priceCards');
+            if (!rows.length) {
+                container.innerHTML = '<span class="price-loading">暂无行情数据，等待 8:30 推送或手动刷新</span>';
+                return;
+            }
+            container.innerHTML = rows.map(r => {
+                const pct = r.change_pct;
+                const pctText = pct == null ? '—'
+                    : (pct > 0 ? `▲ ${Math.abs(pct).toFixed(2)}%`
+                    : pct < 0  ? `▼ ${Math.abs(pct).toFixed(2)}%`
+                    :            `— 0.00%`);
+                const cls = pct == null ? '' : (pct > 0 ? 'up' : pct < 0 ? 'down' : '');
+                return `
+                    <div class="price-card">
+                        <div class="price-name">${escapeHtml(r.name)}</div>
+                        <div class="price-value">${r.price != null ? r.price : '—'} <span class="price-unit">${escapeHtml(r.unit || '')}</span></div>
+                        <div class="price-change ${cls}">${pctText}</div>
+                    </div>`;
+            }).join('');
+        }
     </script>
 </body>
 </html>

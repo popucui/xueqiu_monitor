@@ -3,3 +3,4 @@ apscheduler>=3.10
 requests
 playwright
 python-dotenv
+yfinance>=0.2

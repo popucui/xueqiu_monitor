@@ -42,6 +42,19 @@ def init_db():
         # WAL 模式只需设置一次（持久化），放在初始化阶段
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS commodity_prices (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol      TEXT NOT NULL,
+                name        TEXT DEFAULT '',
+                unit        TEXT DEFAULT '',
+                price       REAL,
+                prev_close  REAL,
+                change_pct  REAL,
+                fetched_at  TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_prices_symbol ON commodity_prices(symbol);
+            CREATE INDEX IF NOT EXISTS idx_prices_time   ON commodity_prices(fetched_at DESC);
+
             CREATE TABLE IF NOT EXISTS posts (
                 id            TEXT PRIMARY KEY,
                 user_id       TEXT NOT NULL,
@@ -106,18 +119,37 @@ def save_posts(posts: list) -> list:
     return new_posts
 
 
-def get_recent_posts(limit: int = 50, author_id: str = None) -> list:
+def get_recent_posts(limit: int = 50, author_id: str = None, offset: int = 0) -> list:
     with _ConnCtx() as conn:
         if author_id:
             rows = conn.execute(
-                "SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-                (author_id, limit),
+                """SELECT * FROM posts
+                   WHERE user_id = ?
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT ? OFFSET ?""",
+                (author_id, limit, offset),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM posts ORDER BY created_at DESC LIMIT ?", (limit,)
+                """SELECT * FROM posts
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT ? OFFSET ?""",
+                (limit, offset),
             ).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_posts(author_id: str = None) -> int:
+    """统计可查询帖子总数，供前端分页展示进度使用"""
+    with _ConnCtx() as conn:
+        if author_id:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM posts WHERE user_id = ?",
+                (author_id,),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS total FROM posts").fetchone()
+    return int(row["total"] or 0)
 
 
 def get_authors_summary() -> list:
@@ -183,5 +215,50 @@ def update_author(user_id: str, name: str) -> bool:
         conn.commit()
     return True
 
+
+# ==================== 商品价格 ====================
+
+def save_prices(prices: dict) -> None:
+    """保存一次抓取的所有品种价格（不含 _errors 键）"""
+    rows = [v for k, v in prices.items() if not k.startswith("_") and isinstance(v, dict)]
+    if not rows:
+        return
+    with _ConnCtx() as conn:
+        for r in rows:
+            conn.execute(
+                """INSERT INTO commodity_prices
+                   (symbol, name, unit, price, prev_close, change_pct, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (r["symbol"], r["name"], r["unit"],
+                 r["price"], r.get("prev_close"), r.get("change_pct"),
+                 r["fetched_at"]),
+            )
+        conn.commit()
+
+
+def get_latest_prices() -> list:
+    """返回每个 symbol 最新一条价格记录"""
+    with _ConnCtx() as conn:
+        rows = conn.execute("""
+            SELECT p.*
+            FROM commodity_prices p
+            INNER JOIN (
+                SELECT symbol, MAX(fetched_at) AS max_at
+                FROM commodity_prices
+                GROUP BY symbol
+            ) latest ON p.symbol = latest.symbol AND p.fetched_at = latest.max_at
+            ORDER BY p.id
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_price_history(symbol: str, limit: int = 30) -> list:
+    """返回某品种最近 N 条历史价格"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            "SELECT * FROM commodity_prices WHERE symbol = ? ORDER BY fetched_at DESC LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 

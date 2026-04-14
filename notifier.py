@@ -93,3 +93,66 @@ def _notify_feishu(posts, url):
 def _notify_dingtalk(posts, url):
     md = _build_markdown(posts)
     _post_with_retry(url, {"msgtype": "markdown", "markdown": {"title": "雪球新动态", "text": md}}, "钉钉")
+
+
+# ==================== 商品价格推送 ====================
+
+def _fmt_change(pct):
+    if pct is None:
+        return "—"
+    sign = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
+    return f"{sign} {abs(pct):.2f}%"
+
+
+def _build_price_markdown(prices: dict) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"## 🌅 早盘行情速报 · {now}\n"]
+    order = ["brent", "wti", "gold", "gvz"]
+    for key in order:
+        item = prices.get(key)
+        if not item:
+            continue
+        chg = _fmt_change(item.get("change_pct"))
+        lines.append(
+            f"**{item['name']}** `{item['symbol']}`  "
+            f"**{item['price']} {item['unit']}**  {chg}"
+        )
+    errors = prices.get("_errors", [])
+    if errors:
+        lines.append(f"\n> ⚠️ 部分数据获取失败: {'; '.join(errors)}")
+    lines.append("\n> *数据来源：Yahoo Finance*")
+    return "\n".join(lines)
+
+
+def notify_prices(prices: dict, config: dict = None):
+    """推送商品价格到配置的 Webhook"""
+    config = config or {}
+    md = _build_price_markdown(prices)
+
+    # 控制台输出
+    print(md)
+
+    wechat_url   = config.get("wechat_webhook_url", "")
+    feishu_url   = config.get("feishu_webhook_url", "")
+    dingtalk_url = config.get("dingtalk_webhook_url", "")
+
+    if wechat_url:
+        _post_with_retry(
+            wechat_url,
+            {"msgtype": "markdown", "markdown": {"content": md}},
+            "企业微信(价格)",
+        )
+    if feishu_url:
+        _post_with_retry(feishu_url, {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"tag": "plain_text", "content": "🌅 早盘行情速报"}},
+                "elements": [{"tag": "markdown", "content": md}],
+            },
+        }, "飞书(价格)")
+    if dingtalk_url:
+        _post_with_retry(
+            dingtalk_url,
+            {"msgtype": "markdown", "markdown": {"title": "早盘行情速报", "text": md}},
+            "钉钉(价格)",
+        )

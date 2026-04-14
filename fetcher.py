@@ -144,62 +144,100 @@ class XueqiuFetcher:
         except Exception as e:
             return {"error": str(e)}
 
-    def fetch_user_posts(self, user_id: str, count: int = 10) -> list:
-        """获取用户帖子"""
-        data = self._fetch_api("/v4/statuses/user_timeline.json", {
-            "user_id": user_id, "page": 1, "count": count
-        })
-        items = data.get("statuses") or data.get("list") or []
+    def _status_to_post(self, user_id: str, status: dict) -> dict:
+        user = status.get("user", {})
+
+        # 优先用 text，fallback 到 description（有些帖子 text 为空但 description 有内容）
+        raw_text = status.get("text", "") or status.get("description", "")
+        text = clean_html(raw_text)
+
+        # 处理转发/引用卡片
+        rt = status.get("retweeted_status")
+        if rt:
+            rt_user = rt.get("user", {}).get("screen_name", "未知用户")
+            rt_text = clean_html(rt.get("text", "") or rt.get("description", ""))
+            text = f"{text}\n\n[转发] @{rt_user}: \n{rt_text}"
+
+        # 处理 quote_cards（长文/公告转发，带卡片预览）
+        quote_cards = status.get("quote_cards")
+        if quote_cards and isinstance(quote_cards, list):
+            for card in quote_cards:
+                card_text = clean_html(card.get("description", "") or card.get("text", ""))
+                card_url = card.get("url") or card.get("link", "")
+                card_title = card.get("title", "")
+                if card_text and card_url:
+                    text = f"{text}\n\n[转发] @{card_title}: \n{card_text}\n{card_url}"
+                elif card_url:
+                    text = f"{text}\n\n[转发] @{card_title}: \n{card_url}"
+
+        status_id = str(status.get("id", ""))
+        return {
+            "id": status_id,
+            "user_id": user_id,
+            "user_name": user.get("screen_name", ""),
+            "title": status.get("title", "") or "",
+            "text": text,
+            "created_at": status.get("created_at", 0),
+            "reply_count": status.get("reply_count", 0),
+            "retweet_count": status.get("retweet_count", 0),
+            "like_count": status.get("like_count") or status.get("fav_count", 0),
+            "source": status.get("source", ""),
+            "target": status.get("target", "") or f"/{user_id}/{status_id}",
+        }
+
+    def fetch_user_posts(self, user_id: str, since_ms: int = None, page_size: int = 20) -> list:
+        """获取用户从 since_ms 至今的帖子，按页抓到越过时间窗口为止"""
         result = []
-        for s in items:
-            user = s.get("user", {})
+        seen_ids = set()
+        page = 1
 
-            # 优先用 text，fallback 到 description（有些帖子 text 为空但 description 有内容）
-            raw_text = s.get("text", "") or s.get("description", "")
-            text = clean_html(raw_text)
-            
-            # 处理转发/引用卡片
-            rt = s.get("retweeted_status")
-            if rt:
-                rt_user = rt.get("user", {}).get("screen_name", "未知用户")
-                rt_text = clean_html(rt.get("text", "") or rt.get("description", ""))
-                text = f"{text}\n\n[转发] @{rt_user}: \n{rt_text}"
-
-            # 处理 quote_cards（长文/公告转发，带卡片预览）
-            quote_cards = s.get("quote_cards")
-            if quote_cards and isinstance(quote_cards, list):
-                for card in quote_cards:
-                    card_text = clean_html(card.get("description", "") or card.get("text", ""))
-                    card_url = card.get("url") or card.get("link", "")
-                    card_title = card.get("title", "")
-                    if card_text and card_url:
-                        text = f"{text}\n\n[转发] @{card_title}: \n{card_text}\n{card_url}"
-                    elif card_url:
-                        text = f"{text}\n\n[转发] @{card_title}: \n{card_url}"
-
-            result.append({
-                "id": str(s.get("id", "")),
-                "user_id": user_id,
-                "user_name": user.get("screen_name", ""),
-                "title": s.get("title", "") or "",
-                "text": text,
-                "created_at": s.get("created_at", 0),
-                "reply_count": s.get("reply_count", 0),
-                "retweet_count": s.get("retweet_count", 0),
-                "like_count": s.get("like_count") or s.get("fav_count", 0),
-                "source": s.get("source", ""),
-                "target": s.get("target", "") or f"/{user_id}/{s.get('id')}",
+        while True:
+            data = self._fetch_api("/v4/statuses/user_timeline.json", {
+                "user_id": user_id, "page": page, "count": page_size
             })
+            items = data.get("statuses") or data.get("list") or []
+            if not items:
+                break
+
+            page_added = 0
+            stop_for_time = False
+            for status in items:
+                status_id = str(status.get("id", ""))
+                try:
+                    created_at = int(status.get("created_at") or 0)
+                except (TypeError, ValueError):
+                    created_at = 0
+                if since_ms is not None and created_at and created_at < since_ms:
+                    stop_for_time = True
+                    break
+                if since_ms is not None and not created_at:
+                    continue
+                if status_id and status_id in seen_ids:
+                    continue
+
+                if status_id:
+                    seen_ids.add(status_id)
+                result.append(self._status_to_post(user_id, status))
+                page_added += 1
+
+            if stop_for_time or len(items) < page_size or page_added == 0:
+                break
+            page += 1
+            self._page.wait_for_timeout(300)
+
         return result
 
-    def fetch_all_authors(self, authors: list, count: int = 10) -> list:
-        """批量获取所有作者的帖子"""
+    def fetch_all_authors(self, authors: list, since_ms: int = None, page_size: int = 20) -> list:
+        """批量获取所有作者在时间窗口内的帖子"""
         all_posts = []
+        if since_ms is not None:
+            since_text = datetime.fromtimestamp(since_ms / 1000).strftime("%Y-%m-%d %H:%M")
+            print(f"  ⏱️ 抓取时间窗口: {since_text} 至今")
         for author in authors:
             uid = author["id"]
             name = author.get("name", uid)
             print(f"  📖 获取 {name} ({uid}) 的动态...")
-            posts = self.fetch_user_posts(uid, count)
+            posts = self.fetch_user_posts(uid, since_ms=since_ms, page_size=page_size)
             # 确保 user_name 有值
             for p in posts:
                 if not p["user_name"]:
