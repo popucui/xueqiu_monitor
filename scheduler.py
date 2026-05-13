@@ -1,6 +1,7 @@
 """
 定时任务调度器
 """
+import atexit
 from apscheduler.schedulers.background import BackgroundScheduler
 
 _scheduler = None
@@ -11,6 +12,7 @@ def _get_scheduler() -> BackgroundScheduler:
     if _scheduler is None or not _scheduler.running:
         _scheduler = BackgroundScheduler(daemon=True, timezone="Asia/Shanghai")
         _scheduler.start()
+        atexit.register(stop_scheduler)
     return _scheduler
 
 

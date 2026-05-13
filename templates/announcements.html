@@ -88,16 +88,25 @@
         }
 
         async function loadAnnouncements() {
-            const stockCode = document.getElementById('stockFilter').value;
-            const params = new URLSearchParams({limit: '200'});
-            if (stockCode) params.set('stock_code', stockCode);
-            const res = await fetch(`/api/announcements?${params}`);
-            const data = await res.json();
-            renderWatchlist(data.watchlist || []);
-            renderModalStocks(data.watchlist || []);
-            renderAnnouncements(data.announcements || []);
-            const last = data.last_fetch ? new Date(data.last_fetch).toLocaleString('zh-CN') : '尚未刷新';
-            document.getElementById('lastUpdate').textContent = `公告刷新：${last}`;
+            try {
+                const stockCode = document.getElementById('stockFilter').value;
+                const params = new URLSearchParams({limit: '200'});
+                if (stockCode) params.set('stock_code', stockCode);
+                const res = await fetch(`/api/announcements?${params}`);
+                const data = await res.json();
+                renderWatchlist(data.watchlist || []);
+                renderModalStocks(data.watchlist || []);
+                renderAnnouncements(data.announcements || []);
+                const last = data.last_fetch ? new Date(data.last_fetch).toLocaleString('zh-CN') : '尚未刷新';
+                document.getElementById('lastUpdate').textContent = `公告刷新：${last}`;
+            } catch (e) {
+                console.error('公告加载失败:', e);
+                document.getElementById('announcementsList').innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">⚠️</div>
+                        <p>加载失败，请稍后重试</p>
+                    </div>`;
+            }
         }
 
         function renderWatchlist(watchlist) {

@@ -81,17 +81,31 @@ Tables:
 
 `database.init_db()` creates missing tables and lightweight migrations. Keep migrations idempotent and preserve existing data.
 
+### Author summary
+
+`get_authors_summary()` uses `authors LEFT JOIN posts` so that newly added authors with zero posts still appear in the sidebar.
+
+### Announcement upsert semantics
+
+`save_announcements()` uses `INSERT ... ON CONFLICT(source, ann_id) DO UPDATE`. The `first_seen_at` column is preserved from the original insert (`COALESCE(announcements.first_seen_at, excluded.first_seen_at)`) and is never overwritten on subsequent updates.
+
+### Post save resilience
+
+`save_posts()` inserts each post individually inside a single transaction. `IntegrityError` (duplicate post) is silently skipped; other per-post exceptions are logged and skipped so that one bad record does not roll back the entire batch.
+
 ## Main Workflows
 
 ### Xueqiu Posts
 
 `do_fetch()` in `app.py`:
 
-1. Starts `XueqiuFetcher`.
+1. Acquires a shared `XueqiuFetcher` singleton (lazy-started once, reused across calls).
 2. Loads authors from `authors`.
 3. Fetches recent posts.
 4. Saves new posts in `posts`.
 5. Sends webhook notification for new posts.
+
+The fetcher singleton is started on first use and only stopped on fetch failure or process exit. This avoids the 5–10 second Chromium startup cost on every scheduled run.
 
 ### Prices
 

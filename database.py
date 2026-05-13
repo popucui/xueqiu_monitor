@@ -5,15 +5,13 @@ import sqlite3
 import os
 from datetime import datetime
 
-DB_PATH = None
+import config
+
+_DB_PATH = os.path.join(os.path.dirname(__file__), config.DB_PATH)
 
 
 def _get_db_path():
-    global DB_PATH
-    if DB_PATH is None:
-        from config import DB_PATH as cfg_path
-        DB_PATH = os.path.join(os.path.dirname(__file__), cfg_path)
-    return DB_PATH
+    return _DB_PATH
 
 
 def get_conn():
@@ -220,6 +218,9 @@ def save_posts(posts: list) -> list:
             except sqlite3.IntegrityError:
                 # 已存在，跳过
                 pass
+            except Exception as e:
+                # 非主键冲突异常（如字段类型错误），记录并继续处理下一条
+                print(f"⚠️ 保存帖子 {pid} 失败: {e}")
         conn.commit()
     return new_posts
 
@@ -258,14 +259,17 @@ def count_posts(author_id: str = None) -> int:
 
 
 def get_authors_summary() -> list:
-    """获取每个作者的帖子统计"""
+    """获取每个作者的帖子统计（包含无帖子的作者）"""
     with _ConnCtx() as conn:
         rows = conn.execute("""
-            SELECT user_id,
-                   MAX(user_name) as user_name,
-                   COUNT(*) as total,
-                   MAX(created_at) as latest_at
-            FROM posts GROUP BY user_id ORDER BY latest_at DESC
+            SELECT a.user_id,
+                   a.name as user_name,
+                   COUNT(p.id) as total,
+                   MAX(p.created_at) as latest_at
+            FROM authors a
+            LEFT JOIN posts p ON a.user_id = p.user_id
+            GROUP BY a.user_id
+            ORDER BY COALESCE(MAX(p.created_at), 0) DESC
         """).fetchall()
     return [dict(r) for r in rows]
 
@@ -526,7 +530,8 @@ def save_announcements(announcements: list) -> list:
                        published_at = excluded.published_at,
                        url = excluded.url,
                        matched_keywords = excluded.matched_keywords,
-                       fetched_at = excluded.fetched_at""",
+                       fetched_at = excluded.fetched_at,
+                       first_seen_at = COALESCE(announcements.first_seen_at, excluded.first_seen_at)""",
                 (
                     source,
                     ann_id,
@@ -537,7 +542,7 @@ def save_announcements(announcements: list) -> list:
                     ann.url,
                     ann.matched_keywords,
                     now,
-                    first_seen_at or now,
+                    first_seen_at,
                 ),
             )
             if existing is None:

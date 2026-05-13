@@ -107,7 +107,8 @@ def _fmt_change(pct):
 def _build_price_markdown(prices: dict) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"## 🌅 早盘行情速报 · {now}\n"]
-    order = ["brent", "wti", "gold", "gvz"]
+    from price_fetcher import _TICKERS
+    order = list(_TICKERS.keys())
     for key in order:
         item = prices.get(key)
         if not item:

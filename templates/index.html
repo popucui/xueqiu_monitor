@@ -570,7 +570,11 @@
         }
 
         async function deleteAuthor(userId) {
-            await fetch(`/api/authors/${userId}`, {method: 'DELETE'});
+            const res = await fetch(`/api/authors/${userId}`, {method: 'DELETE'});
+            if (!res.ok) {
+                showToast('❌ 删除失败', 'error');
+                return;
+            }
             if (currentFilter === userId) currentFilter = 'all';
             showToast('✅ 已删除', 'success');
             await loadData();

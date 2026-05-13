@@ -53,8 +53,9 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 ### Xueqiu Author Monitoring
 
 - Authors are stored in the `authors` table and managed from the homepage modal.
-- `do_fetch()` in `app.py` uses `XueqiuFetcher` to fetch recent posts for tracked authors.
+- `do_fetch()` in `app.py` uses a shared `XueqiuFetcher` singleton to fetch recent posts for tracked authors.
 - Posts are stored in `posts`, deduplicated by post `id`.
+- `get_authors_summary()` returns every tracked author via `LEFT JOIN posts`, so authors with zero posts still appear in the sidebar.
 - Homepage APIs:
   - `GET /api/posts`
   - `GET /api/authors`
@@ -134,6 +135,11 @@ Tables:
 
 When adding schema changes, prefer idempotent migration logic in `init_db()` or helper functions called by it. Preserve existing user data in `xueqiu_monitor.db`.
 
+### Upsert semantics
+
+- `save_announcements()` upserts on `(source, ann_id)`. `first_seen_at` is written only on the initial insert and is protected from later overwrites.
+- `save_posts()` inserts each post individually within one transaction. Duplicate posts (`IntegrityError`) are skipped; other per-post errors are logged and skipped so the rest of the batch still commits.
+
 ## Background Jobs
 
 `scheduler.py` uses a shared `BackgroundScheduler`:
@@ -143,6 +149,8 @@ When adding schema changes, prefer idempotent migration logic in `init_db()` or 
 - `start_announcement_scheduler(do_fetch_announcements, ANNOUNCEMENT_FETCH_INTERVAL_MINUTES)`: announcement tracking.
 
 These start only under `if __name__ == "__main__"` in `app.py` and only outside the Werkzeug reloader child. Importing `app` for tests should not start the background jobs.
+
+`stop_scheduler()` is registered with `atexit` when the scheduler starts, so the daemon thread shuts down gracefully on process exit.
 
 ## Announcement Source Notes
 

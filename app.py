@@ -24,6 +24,8 @@ _fetch_lock = threading.Lock()
 _announcement_fetch_lock = threading.Lock()
 _USER_ID_RE = re.compile(r"^\d{1,32}$")
 _ANNOUNCEMENT_CODE_RE = re.compile(r"^\d{5}\.HK$|^\d{6}\.(SH|SZ|BJ)$")
+_fetcher_singleton = None
+_fetcher_lock = threading.Lock()
 
 
 def _is_valid_user_id(user_id: str) -> bool:
@@ -37,6 +39,26 @@ def _get_json_payload():
     return data
 
 
+def _get_fetcher():
+    global _fetcher_singleton
+    with _fetcher_lock:
+        if _fetcher_singleton is None:
+            _fetcher_singleton = XueqiuFetcher(config.XQ_A_TOKEN, config.XQ_R_TOKEN)
+            _fetcher_singleton.start()
+        return _fetcher_singleton
+
+
+def _stop_fetcher():
+    global _fetcher_singleton
+    with _fetcher_lock:
+        if _fetcher_singleton:
+            try:
+                _fetcher_singleton.stop()
+            except Exception as e:
+                print(f"⚠️ 关闭浏览器失败: {e}")
+            _fetcher_singleton = None
+
+
 def do_fetch():
     """执行一次抓取任务"""
     global _last_fetch_time
@@ -44,10 +66,8 @@ def do_fetch():
         print("⏳ 上一次抓取尚未完成，跳过")
         return {"status": "skipped", "reason": "already running"}
 
-    fetcher = None
     try:
-        fetcher = XueqiuFetcher(config.XQ_A_TOKEN, config.XQ_R_TOKEN)
-        fetcher.start()
+        fetcher = _get_fetcher()
         db_authors = database.get_db_authors()
         authors = [{"id": a["user_id"], "name": a["name"]} for a in db_authors]
         since_dt = datetime.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
@@ -77,14 +97,11 @@ def do_fetch():
         }
     except Exception as e:
         print(f"❌ 抓取失败: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
+        _stop_fetcher()
         return {"status": "error", "message": "抓取失败，请查看服务端日志"}
     finally:
-        if fetcher is not None:
-            try:
-                fetcher.stop()
-            except Exception as stop_error:
-                print(f"⚠️ 关闭浏览器失败: {stop_error}")
         _fetch_lock.release()
 
 
