@@ -4,6 +4,7 @@
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from flask import Flask, render_template, jsonify, request
 
@@ -26,6 +27,10 @@ _USER_ID_RE = re.compile(r"^\d{1,32}$")
 _ANNOUNCEMENT_CODE_RE = re.compile(r"^\d{5}\.HK$|^\d{6}\.(SH|SZ|BJ)$")
 _fetcher_singleton = None
 _fetcher_lock = threading.Lock()
+# Playwright sync API 通过 greenlet 绑定到创建它的线程，跨线程调用会抛
+# `greenlet.error: cannot switch to a different thread`。用单 worker 的
+# executor 把所有 fetcher 操作钉在同一线程上执行。
+_fetcher_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xq-fetcher")
 
 
 def _is_valid_user_id(user_id: str) -> bool:
@@ -39,12 +44,18 @@ def _get_json_payload():
     return data
 
 
+def _run_on_fetcher_thread(fn, *args, **kwargs):
+    """把任意函数派发到固定的 fetcher worker 线程上同步执行。"""
+    return _fetcher_executor.submit(fn, *args, **kwargs).result()
+
+
 def _get_fetcher():
     global _fetcher_singleton
     with _fetcher_lock:
         if _fetcher_singleton is None:
-            _fetcher_singleton = XueqiuFetcher(config.XQ_A_TOKEN, config.XQ_R_TOKEN)
-            _fetcher_singleton.start()
+            fetcher = XueqiuFetcher(config.XQ_A_TOKEN, config.XQ_R_TOKEN)
+            _run_on_fetcher_thread(fetcher.start)
+            _fetcher_singleton = fetcher
         return _fetcher_singleton
 
 
@@ -53,16 +64,27 @@ def _stop_fetcher():
     with _fetcher_lock:
         if _fetcher_singleton:
             try:
-                _fetcher_singleton.stop()
+                _run_on_fetcher_thread(_fetcher_singleton.stop)
             except Exception as e:
                 print(f"⚠️ 关闭浏览器失败: {e}")
             _fetcher_singleton = None
 
 
-def do_fetch():
-    """执行一次抓取任务"""
+def do_fetch(wait_timeout: float = None):
+    """执行一次抓取任务。
+
+    Parameters
+    ----------
+    wait_timeout : float, optional
+        等待锁的秒数。``None`` 表示永久等待（用于用户手动刷新），
+        ``0`` 表示非阻塞立即返回（用于定时调度器跳过）。
+    """
     global _last_fetch_time
-    if not _fetch_lock.acquire(blocking=False):
+    if wait_timeout == 0:
+        acquired = _fetch_lock.acquire(blocking=False)
+    else:
+        acquired = _fetch_lock.acquire(blocking=True, timeout=wait_timeout)
+    if not acquired:
         print("⏳ 上一次抓取尚未完成，跳过")
         return {"status": "skipped", "reason": "already running"}
 
@@ -72,7 +94,8 @@ def do_fetch():
         authors = [{"id": a["user_id"], "name": a["name"]} for a in db_authors]
         since_dt = datetime.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
         since_ms = int(since_dt.timestamp() * 1000)
-        all_posts = fetcher.fetch_all_authors(
+        all_posts = _run_on_fetcher_thread(
+            fetcher.fetch_all_authors,
             authors,
             since_ms=since_ms,
             page_size=config.POST_FETCH_PAGE_SIZE,
@@ -245,7 +268,7 @@ def api_update_author(user_id):
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    result = do_fetch()
+    result = do_fetch(wait_timeout=120)
     return jsonify(result)
 
 
@@ -414,7 +437,7 @@ if __name__ == "__main__":
 
     if not is_reloader_child:
         start_initial_fetch_background()
-        start_scheduler(do_fetch, config.FETCH_INTERVAL_MINUTES)
+        start_scheduler(lambda: do_fetch(wait_timeout=0), config.FETCH_INTERVAL_MINUTES)
         start_price_scheduler(do_fetch_prices,
                               hour=config.PRICE_REPORT_HOUR,
                               minute=config.PRICE_REPORT_MINUTE)

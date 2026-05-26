@@ -207,7 +207,12 @@ class XueqiuFetcher:
                     created_at = int(status.get("created_at") or 0)
                 except (TypeError, ValueError):
                     created_at = 0
+                # 置顶帖 (mark=1) 不参与按时间停止判定，且超出窗口直接跳过；
+                # 否则会因为返回顺序里置顶帖排第一而提前终止分页。
+                is_pinned = status.get("mark") == 1
                 if since_ms is not None and created_at and created_at < since_ms:
+                    if is_pinned:
+                        continue
                     stop_for_time = True
                     break
                 if since_ms is not None and not created_at:
