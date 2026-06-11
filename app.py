@@ -82,6 +82,8 @@ def do_fetch(wait_timeout: float = None):
     global _last_fetch_time
     if wait_timeout == 0:
         acquired = _fetch_lock.acquire(blocking=False)
+    elif wait_timeout is None:
+        acquired = _fetch_lock.acquire(blocking=True)
     else:
         acquired = _fetch_lock.acquire(blocking=True, timeout=wait_timeout)
     if not acquired:
@@ -92,6 +94,10 @@ def do_fetch(wait_timeout: float = None):
         fetcher = _get_fetcher()
         db_authors = database.get_db_authors()
         authors = [{"id": a["user_id"], "name": a["name"]} for a in db_authors]
+        last_post_at = {
+            row["user_id"]: row.get("latest_at") or 0
+            for row in database.get_authors_summary()
+        }
         since_dt = datetime.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
         since_ms = int(since_dt.timestamp() * 1000)
         all_posts = _run_on_fetcher_thread(
@@ -99,6 +105,7 @@ def do_fetch(wait_timeout: float = None):
             authors,
             since_ms=since_ms,
             page_size=config.POST_FETCH_PAGE_SIZE,
+            last_post_at=last_post_at,
         )
 
         new_posts = database.save_posts(all_posts)

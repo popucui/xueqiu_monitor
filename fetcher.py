@@ -131,18 +131,35 @@ class XueqiuFetcher:
         return False
 
     def _fetch_api(self, path: str, params: dict) -> dict:
+        """调用雪球 API。
+
+        - 5xx 或 body 非 JSON（多半是 WAF 重挑战返回的 HTML）：抛 RuntimeError，
+          上层 `do_fetch` 会重启 singleton。
+        - 其它情况（含 4xx + error_code 的合法错误 JSON）：把 dict 返回，由
+          调用方根据上下文判断。例如 `user_timeline.json` 在 page>1 时常态化
+          返回 400 + 10022 "请登录雪球查看更多内容"，那是分页边界不是失败。
+        """
         url = f"{path}?{urlencode(params)}"
+        payload = self._page.evaluate("""
+            async (url) => {
+                const resp = await fetch(url, {
+                    headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
+                });
+                const text = await resp.text();
+                return { status: resp.status, body: text };
+            }
+        """, url)
+        status = payload.get("status")
+        body = payload.get("body") or ""
         try:
-            return self._page.evaluate("""
-                async (url) => {
-                    const resp = await fetch(url, {
-                        headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
-                    });
-                    return await resp.json();
-                }
-            """, url)
-        except Exception as e:
-            return {"error": str(e)}
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"xueqiu api {path} status={status} returned non-json (likely WAF), body[:200]={body[:200]!r}"
+            ) from e
+        if status is None or status >= 500:
+            raise RuntimeError(f"xueqiu api {path} server error status={status} body={data}")
+        return data
 
     def _status_to_post(self, user_id: str, status: dict) -> dict:
         user = status.get("user", {})
@@ -195,6 +212,17 @@ class XueqiuFetcher:
             data = self._fetch_api("/v4/statuses/user_timeline.json", {
                 "user_id": user_id, "page": page, "count": page_size
             })
+            # 雪球对未登录/非关注用户的 user_timeline 通常只放 page=1，page>1
+            # 直接返回 4xx + error_code=10022 "请登录雪球查看更多内容"。这是
+            # 分页边界，不是会话失效。但 page=1 就拿到 error_code 则确实是
+            # cookie 失效或 WAF 拦截，必须抛出让 singleton 重启。
+            err_code = data.get("error_code")
+            if err_code:
+                if page == 1:
+                    raise RuntimeError(
+                        f"xueqiu user_timeline user={user_id} page=1 error={err_code} desc={data.get('error_description')!r}"
+                    )
+                break
             items = data.get("statuses") or data.get("list") or []
             if not items:
                 break
@@ -232,22 +260,33 @@ class XueqiuFetcher:
 
         return result
 
-    def fetch_all_authors(self, authors: list, since_ms: int = None, page_size: int = 20) -> list:
-        """批量获取所有作者在时间窗口内的帖子"""
+    def fetch_all_authors(self, authors: list, since_ms: int = None, page_size: int = 20,
+                          last_post_at: dict = None) -> list:
+        """批量获取所有作者在时间窗口内的帖子。
+
+        ``last_post_at`` 可选 ``{user_id: created_at_ms}``，用于在抓到 0 条时打印
+        warning —— 抓不到不代表用户没发帖，这是静默失败的早期信号。
+        """
         all_posts = []
         if since_ms is not None:
             since_text = datetime.fromtimestamp(since_ms / 1000).strftime("%Y-%m-%d %H:%M")
             print(f"  ⏱️ 抓取时间窗口: {since_text} 至今")
+        now_ms = int(datetime.now().timestamp() * 1000)
+        stale_threshold_ms = 6 * 3600 * 1000
         for author in authors:
             uid = author["id"]
             name = author.get("name", uid)
             print(f"  📖 获取 {name} ({uid}) 的动态...")
             posts = self.fetch_user_posts(uid, since_ms=since_ms, page_size=page_size)
-            # 确保 user_name 有值
             for p in posts:
                 if not p["user_name"]:
                     p["user_name"] = name
             all_posts.extend(posts)
             print(f"     → {len(posts)} 条")
-            self._page.wait_for_timeout(1000)  # 请求间隔
+            if not posts and last_post_at:
+                last_ts = last_post_at.get(uid) or 0
+                if last_ts and (now_ms - last_ts) > stale_threshold_ms:
+                    last_text = datetime.fromtimestamp(last_ts / 1000).strftime("%Y-%m-%d %H:%M")
+                    print(f"     ⚠️ {name} 抓到 0 条，DB 最新一条停留在 {last_text}，可能静默失败")
+            self._page.wait_for_timeout(1000)
         return all_posts
