@@ -55,6 +55,7 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 - Authors are stored in the `authors` table and managed from the homepage modal.
 - `do_fetch()` in `app.py` uses a shared `XueqiuFetcher` singleton to fetch recent posts for tracked authors.
 - Posts are stored in `posts`, deduplicated by post `id`.
+- The singleton runs on a dedicated executor thread (`_fetcher_executor`, single-worker `ThreadPoolExecutor`) because Playwright's sync API requires greenlet thread affinity. On `_stop_fetcher()`, the executor is replaced with a fresh one to avoid a residual asyncio event loop that would block `sync_playwright().start()` on the same thread.
 - `get_authors_summary()` returns every tracked author via `LEFT JOIN posts`, so authors with zero posts still appear in the sidebar.
 - Homepage APIs:
   - `GET /api/posts`

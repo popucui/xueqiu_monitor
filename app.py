@@ -60,7 +60,7 @@ def _get_fetcher():
 
 
 def _stop_fetcher():
-    global _fetcher_singleton
+    global _fetcher_singleton, _fetcher_executor
     with _fetcher_lock:
         if _fetcher_singleton:
             try:
@@ -68,6 +68,13 @@ def _stop_fetcher():
             except Exception as e:
                 print(f"⚠️ 关闭浏览器失败: {e}")
             _fetcher_singleton = None
+        # sync_playwright().start() 会在 executor 线程上创建 asyncio event loop；
+        # stop() 未必能完全清理，导致同线程下次 start() 报
+        # "using Playwright Sync API inside the asyncio loop"。重建 executor
+        # 换一个干净线程即可恢复。
+        old_executor = _fetcher_executor
+        _fetcher_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xq-fetcher")
+        old_executor.shutdown(wait=False)
 
 
 def do_fetch(wait_timeout: float = None):
@@ -130,7 +137,7 @@ def do_fetch(wait_timeout: float = None):
         import traceback
         traceback.print_exc()
         _stop_fetcher()
-        return {"status": "error", "message": "抓取失败，请查看服务端日志"}
+        return {"status": "error", "message": str(e)}
     finally:
         _fetch_lock.release()
 

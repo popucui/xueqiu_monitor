@@ -107,6 +107,8 @@ Tables:
 
 The fetcher singleton is started on first use and only stopped on fetch failure or process exit. This avoids the 5–10 second Chromium startup cost on every scheduled run.
 
+`_stop_fetcher()` also replaces `_fetcher_executor` with a fresh `ThreadPoolExecutor`. This is necessary because `sync_playwright().start()` leaves an asyncio event loop on the executor thread; if the same thread is reused, the next `start()` raises `"using Playwright Sync API inside the asyncio loop"`. A fresh executor gets a clean thread and recovers automatically.
+
 ### Prices
 
 `do_fetch_prices()` in `app.py`:
