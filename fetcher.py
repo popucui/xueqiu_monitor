@@ -114,13 +114,22 @@ class XueqiuFetcher:
         print(f"  ✅ {title}")
 
     def stop(self):
+        errors = []
         if self._browser:
-            self._browser.close()
+            try:
+                self._browser.close()
+            except Exception as e:
+                errors.append(e)
         if self._pw:
-            self._pw.stop()
+            try:
+                self._pw.stop()
+            except Exception as e:
+                errors.append(e)
         self._browser = None
         self._pw = None
         self._page = None
+        if errors:
+            raise RuntimeError(f"浏览器/Playwright 清理过程中出现 {len(errors)} 个异常: {errors}")
 
     def __enter__(self):
         self.start()
@@ -130,14 +139,16 @@ class XueqiuFetcher:
         self.stop()
         return False
 
-    def _fetch_api(self, path: str, params: dict) -> dict:
+    def _fetch_api(self, path: str, params: dict) -> tuple:
         """调用雪球 API。
 
         - 5xx 或 body 非 JSON（多半是 WAF 重挑战返回的 HTML）：抛 RuntimeError，
           上层 `do_fetch` 会重启 singleton。
-        - 其它情况（含 4xx + error_code 的合法错误 JSON）：把 dict 返回，由
-          调用方根据上下文判断。例如 `user_timeline.json` 在 page>1 时常态化
-          返回 400 + 10022 "请登录雪球查看更多内容"，那是分页边界不是失败。
+        - 其它情况（含 4xx + error_code 的合法错误 JSON）：把 ``(status, data)``
+          返回，由调用方根据上下文判断。例如 `user_timeline.json` 在 page>1 时
+          常态化返回 400 + 10022 "请登录雪球查看更多内容"，那是分页边界不是失败。
+          调用方也需要处理"4xx 但 body 里没有 error_code"这种不认识的异常形态，
+          不能默认当成分页正常结束。
         """
         url = f"{path}?{urlencode(params)}"
         payload = self._page.evaluate("""
@@ -159,7 +170,7 @@ class XueqiuFetcher:
             ) from e
         if status is None or status >= 500:
             raise RuntimeError(f"xueqiu api {path} server error status={status} body={data}")
-        return data
+        return status, data
 
     def _status_to_post(self, user_id: str, status: dict) -> dict:
         user = status.get("user", {})
@@ -188,6 +199,9 @@ class XueqiuFetcher:
                     text = f"{text}\n\n[转发] @{card_title}: \n{card_url}"
 
         status_id = str(status.get("id", ""))
+        like_count = status.get("like_count")
+        if like_count is None:
+            like_count = status.get("fav_count", 0)
         return {
             "id": status_id,
             "user_id": user_id,
@@ -197,7 +211,7 @@ class XueqiuFetcher:
             "created_at": status.get("created_at", 0),
             "reply_count": status.get("reply_count", 0),
             "retweet_count": status.get("retweet_count", 0),
-            "like_count": status.get("like_count") or status.get("fav_count", 0),
+            "like_count": like_count,
             "source": status.get("source", ""),
             "target": status.get("target", "") or f"/{user_id}/{status_id}",
         }
@@ -209,7 +223,7 @@ class XueqiuFetcher:
         page = 1
 
         while True:
-            data = self._fetch_api("/v4/statuses/user_timeline.json", {
+            status_code, data = self._fetch_api("/v4/statuses/user_timeline.json", {
                 "user_id": user_id, "page": page, "count": page_size
             })
             # 雪球对未登录/非关注用户的 user_timeline 通常只放 page=1，page>1
@@ -222,6 +236,21 @@ class XueqiuFetcher:
                     raise RuntimeError(
                         f"xueqiu user_timeline user={user_id} page=1 error={err_code} desc={data.get('error_description')!r}"
                     )
+                break
+            # 4xx 但 body 里没有已知的 error_code：这不是文档记录过的分页边界
+            # 形态，可能是接口改版或限流的新错误结构。page=1 直接当失败抛出
+            # 重启 singleton；page>1 保守起见仍按分页结束处理，但打印明确的
+            # 异常告警而不是当成正常空分页悄悄放过。
+            if status_code is not None and status_code >= 400:
+                if page == 1:
+                    raise RuntimeError(
+                        f"xueqiu user_timeline user={user_id} page=1 status={status_code} "
+                        f"无 error_code，响应异常 body={data!r}"
+                    )
+                print(
+                    f"     ⚠️ {user_id} page={page} 返回 status={status_code} 且无 error_code，"
+                    f"按分页结束处理但该响应形态异常，可能存在静默丢失"
+                )
                 break
             items = data.get("statuses") or data.get("list") or []
             if not items:

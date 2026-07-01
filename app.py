@@ -22,6 +22,7 @@ app = Flask(__name__)
 _last_fetch_time = None
 _last_announcement_fetch_time = None
 _fetch_lock = threading.Lock()
+_price_fetch_lock = threading.Lock()
 _announcement_fetch_lock = threading.Lock()
 _USER_ID_RE = re.compile(r"^\d{1,32}$")
 _ANNOUNCEMENT_CODE_RE = re.compile(r"^\d{5}\.HK$|^\d{6}\.(SH|SZ|BJ)$")
@@ -65,8 +66,10 @@ def _stop_fetcher():
         if _fetcher_singleton:
             try:
                 _run_on_fetcher_thread(_fetcher_singleton.stop)
-            except Exception as e:
-                print(f"⚠️ 关闭浏览器失败: {e}")
+            except Exception:
+                import traceback
+                print("⚠️ 关闭浏览器失败（可能残留 Chromium 进程）:")
+                traceback.print_exc()
             _fetcher_singleton = None
         # sync_playwright().start() 会在 executor 线程上创建 asyncio event loop；
         # stop() 未必能完全清理，导致同线程下次 start() 报
@@ -290,6 +293,9 @@ def api_refresh():
 
 def do_fetch_prices():
     """执行一次价格抓取并推送"""
+    if not _price_fetch_lock.acquire(blocking=False):
+        print("⏳ 上一次价格抓取尚未完成，跳过")
+        return {"status": "skipped", "reason": "already running"}
     try:
         prices = fetch_prices()
         database.save_prices(prices)
@@ -303,6 +309,8 @@ def do_fetch_prices():
         print(f"❌ 价格抓取失败: {e}")
         import traceback; traceback.print_exc()
         return {"status": "error", "message": str(e)}
+    finally:
+        _price_fetch_lock.release()
 
 
 def do_fetch_announcements():
