@@ -56,6 +56,8 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 - `do_fetch()` in `app.py` uses a shared `XueqiuFetcher` singleton to fetch recent posts for tracked authors.
 - Posts are stored in `posts`, deduplicated by post `id`.
 - The singleton runs on a dedicated executor thread (`_fetcher_executor`, single-worker `ThreadPoolExecutor`) because Playwright's sync API requires greenlet thread affinity. On `_stop_fetcher()`, the executor is replaced with a fresh one to avoid a residual asyncio event loop that would block `sync_playwright().start()` on the same thread.
+- `fetch_all_authors()` returns `(posts, errors)`. A failure for one author is recorded in `errors` and the remaining authors are still fetched; already-fetched posts are always saved. `do_fetch()` restarts the singleton only when every author failed (session/WAF-level signal), and includes an `errors` list in the API response on partial failure.
+- If `fetcher.start()` fails partway, `_get_fetcher()` calls `fetcher.stop()` before re-raising to avoid leaking Chromium processes.
 - `get_authors_summary()` returns every tracked author via `LEFT JOIN posts`, so authors with zero posts still appear in the sidebar.
 - Homepage APIs:
   - `GET /api/posts`
@@ -75,6 +77,11 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
   - `GET /api/prices`
   - `GET /api/prices/history`
   - `POST /api/prices/refresh`
+
+### Notifications
+
+- `notifier.py` splits post notifications into batches by rendered markdown size (WeChat Work 3800 bytes, DingTalk 18000, Feishu 20000) so large batches (e.g. first fetch after adding an author) are not rejected by platform limits.
+- `_post_with_retry` also checks the response body for `errcode`/`code`, because WeChat Work/DingTalk/Feishu report business failures with HTTP 200.
 
 ### Announcement Tracking
 
@@ -97,6 +104,8 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 
 Announcement results are intentionally not filtered out yet. The UI displays all fetched announcements and only marks keyword hits. The owner plans to run it for a while before deciding what to suppress.
 
+`fetch_for_watchlist()` returns `(announcements, errors)`: a failure for one stock does not block the others, and `POST /api/announcements/refresh` includes an `errors` list on partial failure.
+
 ## Configuration
 
 Configuration lives in `.env` and `config.py`.
@@ -107,7 +116,7 @@ Known environment variables:
 - `XQ_R_TOKEN`: Xueqiu `xq_r_token`.
 - `POST_LOOKBACK_DAYS`: Xueqiu post lookback window, default `7`.
 - `POST_FETCH_PAGE_SIZE`: Xueqiu fetch page size, default `20`.
-- `FETCH_INTERVAL_MINUTES`: Xueqiu background fetch interval, default `60` in `config.py`.
+- `FETCH_INTERVAL_MINUTES`: Xueqiu background fetch interval, default `60`.
 - `WECHAT_WEBHOOK_URL`: Enterprise WeChat webhook. Empty disables push.
 - `FEISHU_WEBHOOK_URL`: Feishu webhook. Empty disables push.
 - `DINGTALK_WEBHOOK_URL`: DingTalk webhook. Empty disables push.
@@ -158,14 +167,12 @@ These start only under `if __name__ == "__main__"` in `app.py` and only outside 
 For HKEX:
 
 - The public stock code is not the same as HKEX's internal `stockId`.
-- `announcements.py` resolves `stockId` from HKEX's active stock JSON when `stock_id` is blank.
-- For known stocks, storing `stock_id` in `announcement_watchlist` avoids repeated resolution.
+- `announcements.py` resolves `stockId` from HKEX's active stock JSON when `stock_id` is blank, then persists it back to `announcement_watchlist` so later runs skip the full-list download.
 
 For CNINFO:
 
 - A-share queries need both stock code and CNINFO `orgId`.
-- `announcements.py` resolves `orgId` through CNINFO search when `org_id` is blank.
-- For known stocks, storing `org_id` avoids repeated resolution.
+- `announcements.py` resolves `orgId` through CNINFO search when `org_id` is blank, then persists it back to `announcement_watchlist` so later runs skip resolution.
 
 ## UI Guidelines
 

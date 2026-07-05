@@ -107,6 +107,8 @@ Tables:
 
 The fetcher singleton is started on first use and only stopped on fetch failure or process exit. This avoids the 5–10 second Chromium startup cost on every scheduled run.
 
+`fetch_all_authors()` returns `(posts, errors)`: a failure for one author is recorded in `errors` and the remaining authors are still fetched, so a partial failure never discards already-fetched posts. `do_fetch()` restarts the fetcher singleton only when every author failed (session/WAF-level failure); per-author failures keep the singleton alive. If `fetcher.start()` itself fails partway, `_get_fetcher()` calls `fetcher.stop()` before re-raising so no Chromium process leaks.
+
 `_stop_fetcher()` also replaces `_fetcher_executor` with a fresh `ThreadPoolExecutor`. This is necessary because `sync_playwright().start()` leaves an asyncio event loop on the executor thread; if the same thread is reused, the next `start()` raises `"using Playwright Sync API inside the asyncio loop"`. A fresh executor gets a clean thread and recovers automatically.
 
 ### Prices
@@ -122,9 +124,9 @@ The fetcher singleton is started on first use and only stopped on fetch failure 
 `do_fetch_announcements()` in `app.py`:
 
 1. Reads `announcement_watchlist`.
-2. Calls `announcements.fetch_for_watchlist()`.
+2. Calls `announcements.fetch_for_watchlist()`, which returns `(announcements, errors)`; a failure for one stock does not block the others.
 3. Saves all fetched announcements in `announcements`.
-4. Returns total and newly inserted counts.
+4. Returns total and newly inserted counts, plus `errors` when some stocks failed.
 
 Announcement page:
 
@@ -143,8 +145,8 @@ Default announcement watchlist:
 
 For new companies:
 
-- Hong Kong stocks use `source=hkex` and codes like `00700.HK`. `stock_id` may be blank; the fetcher resolves it.
-- A shares use `source=cninfo` and codes like `600519.SH`, `000001.SZ`, or `8xxxxx.BJ`. `org_id` may be blank; the fetcher resolves it.
+- Hong Kong stocks use `source=hkex` and codes like `00700.HK`. `stock_id` may be blank; the fetcher resolves it and persists it back to `announcement_watchlist`.
+- A shares use `source=cninfo` and codes like `600519.SH`, `000001.SZ`, or `8xxxxx.BJ`. `org_id` may be blank; the fetcher resolves it and persists it back to `announcement_watchlist`.
 
 ## Development Rules
 
