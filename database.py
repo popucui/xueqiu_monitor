@@ -492,6 +492,24 @@ def add_announcement_stock(
             return False
 
 
+def update_announcement_stock_ids(code: str, org_id: str = "", stock_id: str = "") -> None:
+    """回写解析出的 org_id / stock_id，后续抓取免去重复解析请求"""
+    if not code or not (org_id or stock_id):
+        return
+    with _ConnCtx() as conn:
+        if org_id:
+            conn.execute(
+                "UPDATE announcement_watchlist SET org_id = ? WHERE code = ?",
+                (str(org_id), code),
+            )
+        if stock_id:
+            conn.execute(
+                "UPDATE announcement_watchlist SET stock_id = ? WHERE code = ?",
+                (str(stock_id), code),
+            )
+        conn.commit()
+
+
 def delete_announcement_stock(code: str) -> bool:
     """删除公告关注股票。历史公告保留，返回 True。"""
     code = (code or "").strip().upper()

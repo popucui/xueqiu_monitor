@@ -55,7 +55,17 @@ def _get_fetcher():
     with _fetcher_lock:
         if _fetcher_singleton is None:
             fetcher = XueqiuFetcher(config.XQ_A_TOKEN, config.XQ_R_TOKEN)
-            _run_on_fetcher_thread(fetcher.start)
+            try:
+                _run_on_fetcher_thread(fetcher.start)
+            except Exception:
+                # start() 半途失败（如 goto 被 WAF 卡住超时）时浏览器可能已经
+                # 启动，singleton 未赋值就没人管它了，必须就地清理否则每次
+                # 重试都泄漏一个 Chromium 进程
+                try:
+                    _run_on_fetcher_thread(fetcher.stop)
+                except Exception:
+                    pass
+                raise
             _fetcher_singleton = fetcher
         return _fetcher_singleton
 
@@ -110,7 +120,7 @@ def do_fetch(wait_timeout: float = None):
         }
         since_dt = datetime.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
         since_ms = int(since_dt.timestamp() * 1000)
-        all_posts = _run_on_fetcher_thread(
+        all_posts, fetch_errors = _run_on_fetcher_thread(
             fetcher.fetch_all_authors,
             authors,
             since_ms=since_ms,
@@ -128,13 +138,22 @@ def do_fetch(wait_timeout: float = None):
                 "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
             })
 
-        return {
+        # 全部作者都失败基本可断定是会话失效/WAF 拦截而非个别作者异常，
+        # 重启浏览器让下次抓取重新过 WAF；个别作者失败则保留 singleton，
+        # 避免一个长期异常的作者导致每轮都重启浏览器。
+        if fetch_errors and len(fetch_errors) == len(authors):
+            _stop_fetcher()
+
+        result = {
             "status": "ok",
             "total_fetched": len(all_posts),
             "new_posts": len(new_posts),
             "lookback_days": config.POST_LOOKBACK_DAYS,
             "time": _last_fetch_time,
         }
+        if fetch_errors:
+            result["errors"] = [f"{e['name']}: {e['error']}" for e in fetch_errors]
+        return result
     except Exception as e:
         print(f"❌ 抓取失败: {e}")
         import traceback
@@ -322,20 +341,23 @@ def do_fetch_announcements():
 
     try:
         watchlist = database.get_announcement_watchlist()
-        rows = announcements.fetch_for_watchlist(
+        rows, fetch_errors = announcements.fetch_for_watchlist(
             watchlist,
             days_back=config.ANNOUNCEMENT_LOOKBACK_DAYS,
             page_size=config.ANNOUNCEMENT_FETCH_PAGE_SIZE,
         )
         new_rows = database.save_announcements(rows)
         _last_announcement_fetch_time = datetime.now().isoformat()
-        return {
+        result = {
             "status": "ok",
             "total_fetched": len(rows),
             "new_announcements": len(new_rows),
             "lookback_days": config.ANNOUNCEMENT_LOOKBACK_DAYS,
             "time": _last_announcement_fetch_time,
         }
+        if fetch_errors:
+            result["errors"] = fetch_errors
+        return result
     except Exception as e:
         print(f"❌ 公告抓取失败: {e}")
         import traceback; traceback.print_exc()

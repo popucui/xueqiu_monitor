@@ -14,7 +14,7 @@ XQ_A_TOKEN = os.getenv("XQ_A_TOKEN", "")
 XQ_R_TOKEN = os.getenv("XQ_R_TOKEN", "")
 
 # ==================== 抓取设置 ====================
-FETCH_INTERVAL_MINUTES = 60   # 定时抓取间隔（分钟）
+FETCH_INTERVAL_MINUTES = int(os.getenv("FETCH_INTERVAL_MINUTES", "60"))  # 定时抓取间隔（分钟）
 POST_LOOKBACK_DAYS = int(os.getenv("POST_LOOKBACK_DAYS", "7"))  # 每次抓取近 N 天动态
 POST_FETCH_PAGE_SIZE = int(os.getenv("POST_FETCH_PAGE_SIZE", "20"))  # 雪球接口每页抓取条数
 

@@ -290,13 +290,18 @@ class XueqiuFetcher:
         return result
 
     def fetch_all_authors(self, authors: list, since_ms: int = None, page_size: int = 20,
-                          last_post_at: dict = None) -> list:
-        """批量获取所有作者在时间窗口内的帖子。
+                          last_post_at: dict = None) -> tuple:
+        """批量获取所有作者在时间窗口内的帖子，返回 ``(posts, errors)``。
+
+        单个作者抓取失败只记入 ``errors``（元素为 ``{"user_id", "name",
+        "error"}``）并继续下一个作者，避免一个作者出错丢掉整批已抓到的
+        帖子。是否需要重启 singleton 由调用方根据 errors 数量判断。
 
         ``last_post_at`` 可选 ``{user_id: created_at_ms}``，用于在抓到 0 条时打印
         warning —— 抓不到不代表用户没发帖，这是静默失败的早期信号。
         """
         all_posts = []
+        errors = []
         if since_ms is not None:
             since_text = datetime.fromtimestamp(since_ms / 1000).strftime("%Y-%m-%d %H:%M")
             print(f"  ⏱️ 抓取时间窗口: {since_text} 至今")
@@ -306,7 +311,13 @@ class XueqiuFetcher:
             uid = author["id"]
             name = author.get("name", uid)
             print(f"  📖 获取 {name} ({uid}) 的动态...")
-            posts = self.fetch_user_posts(uid, since_ms=since_ms, page_size=page_size)
+            try:
+                posts = self.fetch_user_posts(uid, since_ms=since_ms, page_size=page_size)
+            except Exception as e:
+                print(f"     ❌ {name} 抓取失败: {e}")
+                errors.append({"user_id": uid, "name": name, "error": str(e)})
+                self._page.wait_for_timeout(1000)
+                continue
             for p in posts:
                 if not p["user_name"]:
                     p["user_name"] = name
@@ -318,4 +329,4 @@ class XueqiuFetcher:
                     last_text = datetime.fromtimestamp(last_ts / 1000).strftime("%Y-%m-%d %H:%M")
                     print(f"     ⚠️ {name} 抓到 0 条，DB 最新一条停留在 {last_text}，可能静默失败")
             self._page.wait_for_timeout(1000)
-        return all_posts
+        return all_posts, errors

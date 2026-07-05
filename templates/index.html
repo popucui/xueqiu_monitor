@@ -469,7 +469,10 @@
                 const data = await res.json();
 
                 if (data.status === 'ok') {
-                    showToast(`✅ 抓取完成！获取 ${data.total_fetched} 条，新增 ${data.new_posts} 条`, 'success');
+                    const failed = (data.errors || []).length;
+                    let msg = `✅ 抓取完成！获取 ${data.total_fetched} 条，新增 ${data.new_posts} 条`;
+                    if (failed) msg += `（${failed} 个作者抓取失败）`;
+                    showToast(msg, failed ? 'error' : 'success');
                     await loadData();
                 } else if (data.status === 'skipped') {
                     showToast('⏳ 上一次抓取尚未完成', 'error');
@@ -604,12 +607,35 @@
             });
         }
 
+        // 定时刷新只更新侧边栏统计，不重置帖子列表（loadData 会把懒加载
+        // 进度拉回第一页，打断正在阅读的用户）
+        async function refreshSidebar() {
+            try {
+                const res = await fetch('/api/authors');
+                const data = await res.json();
+                dbAuthors = data.db_authors || [];
+                totalAllPosts = data.total_posts || 0;
+                authorSummaryMap = {};
+                (data.authors || []).forEach(s => { authorSummaryMap[s.user_id] = s; });
+                renderAuthors(getEnrichedAuthors());
+
+                const latestTotal = currentFilter === 'all'
+                    ? totalAllPosts
+                    : (authorSummaryMap[currentFilter] ? authorSummaryMap[currentFilter].total : 0);
+                if (currentTotalPosts && latestTotal > currentTotalPosts) {
+                    showToast(`📬 有 ${latestTotal - currentTotalPosts} 条新动态，点击作者或「全部动态」查看`, 'success');
+                }
+            } catch (e) {
+                console.error('侧边栏刷新失败:', e);
+            }
+        }
+
         // 初始化
         setupLazyLoader();
         loadData();
         loadPrices();
-        // 每 5 分钟自动刷新前端数据
-        setInterval(loadData, 5 * 60 * 1000);
+        // 每 5 分钟自动刷新侧边栏统计
+        setInterval(refreshSidebar, 5 * 60 * 1000);
         // 每 10 分钟刷新行情
         setInterval(loadPrices, 10 * 60 * 1000);
 

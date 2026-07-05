@@ -174,7 +174,10 @@
                 const res = await fetch('/api/announcements/refresh', {method: 'POST'});
                 const data = await res.json();
                 if (data.status === 'ok') {
-                    showToast(`✅ 公告已更新：新增 ${data.new_announcements || 0} 条`, 'success');
+                    const failed = (data.errors || []).length;
+                    let msg = `✅ 公告已更新：新增 ${data.new_announcements || 0} 条`;
+                    if (failed) msg += `（${failed} 只股票抓取失败）`;
+                    showToast(msg, failed ? 'error' : 'success');
                     await loadAnnouncements();
                 } else {
                     showToast(`❌ ${data.message || '公告刷新失败'}`, 'error');

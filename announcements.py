@@ -11,6 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import database
+
 CN_TZ = timezone(timedelta(hours=8), name="UTC+08:00")
 HKEX_BASE = "https://www1.hkexnews.hk"
 CNINFO_BASE = "https://www.cninfo.com.cn"
@@ -62,19 +64,31 @@ def http_json(
     raise RuntimeError(f"公告源请求失败: {url}: {last_error}")
 
 
-def fetch_for_watchlist(watchlist: list[dict], days_back: int, page_size: int) -> list[Announcement]:
+def fetch_for_watchlist(
+    watchlist: list[dict], days_back: int, page_size: int
+) -> tuple[list[Announcement], list[str]]:
+    """抓取 watchlist 全部公告，返回 ``(announcements, errors)``。
+
+    单只股票失败只记入 errors 并继续，避免一只股票的网络异常
+    导致整个 watchlist 的公告都不落库。
+    """
     to_day = datetime.now(CN_TZ).date()
     from_day = to_day - timedelta(days=days_back)
     announcements = []
+    errors = []
     for stock in watchlist:
         source = (stock.get("source") or "").lower()
-        if source == "cninfo":
-            announcements.extend(fetch_cninfo(stock, from_day, to_day, page_size))
-        elif source == "hkex":
-            announcements.extend(fetch_hkex(stock, from_day, to_day, page_size))
-        else:
-            raise RuntimeError(f"不支持的公告源: {stock.get('code')} {source}")
-    return announcements
+        try:
+            if source == "cninfo":
+                announcements.extend(fetch_cninfo(stock, from_day, to_day, page_size))
+            elif source == "hkex":
+                announcements.extend(fetch_hkex(stock, from_day, to_day, page_size))
+            else:
+                raise RuntimeError(f"不支持的公告源: {source}")
+        except Exception as exc:
+            print(f"⚠️ 公告抓取失败 {stock.get('code')}: {exc}")
+            errors.append(f"{stock.get('code')}: {exc}")
+    return announcements, errors
 
 
 def resolve_cninfo_org_id(stock: dict) -> str:
@@ -92,7 +106,10 @@ def resolve_cninfo_org_id(stock: dict) -> str:
     )
     for item in response.get("keyBoardList", []):
         if item.get("code") == code:
-            return item["orgId"]
+            org_id = str(item["orgId"])
+            # 回写数据库，之后的抓取不再重复请求解析接口
+            database.update_announcement_stock_ids(stock["code"], org_id=org_id)
+            return org_id
     raise RuntimeError(f"无法解析巨潮 orgId: {stock['code']}")
 
 
@@ -164,7 +181,10 @@ def resolve_hkex_stock_id(stock: dict) -> str:
     )
     for item in response:
         if item.get("c") == code:
-            return str(item["i"])
+            stock_id = str(item["i"])
+            # 回写数据库，避免每次抓取都下载全市场股票列表来解析
+            database.update_announcement_stock_ids(stock["code"], stock_id=stock_id)
+            return stock_id
     raise RuntimeError(f"无法解析 HKEX stockId: {stock['code']}")
 
 
