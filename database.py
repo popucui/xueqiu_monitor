@@ -106,6 +106,17 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id);
             CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS post_notification_outbox (
+                post_id     TEXT NOT NULL,
+                channel     TEXT NOT NULL,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT DEFAULT '',
+                created_at  TEXT DEFAULT '',
+                PRIMARY KEY (post_id, channel)
+            );
+            CREATE INDEX IF NOT EXISTS idx_post_notification_outbox_channel
+                ON post_notification_outbox(channel, created_at);
+
             CREATE TABLE IF NOT EXISTS authors (
                 user_id   TEXT PRIMARY KEY,
                 name      TEXT NOT NULL DEFAULT '',
@@ -223,6 +234,74 @@ def save_posts(posts: list) -> list:
                 print(f"⚠️ 保存帖子 {pid} 失败: {e}")
         conn.commit()
     return new_posts
+
+
+def enqueue_post_notifications(posts: list, channels: list[str]) -> None:
+    """将新帖子加入各通知渠道的持久化待发送队列。"""
+    post_ids = [str(post.get("id") or "") for post in posts]
+    post_ids = [post_id for post_id in post_ids if post_id]
+    channel_names = sorted({str(channel).strip() for channel in channels if str(channel).strip()})
+    if not post_ids or not channel_names:
+        return
+
+    now = datetime.now().isoformat()
+    rows = [
+        (post_id, channel, now)
+        for post_id in post_ids
+        for channel in channel_names
+    ]
+    with _ConnCtx() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO post_notification_outbox
+               (post_id, channel, created_at)
+               VALUES (?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+
+
+def get_pending_post_notifications(channel: str, limit: int = 500) -> list:
+    """返回指定渠道尚未发送成功的帖子。"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT p.*, o.attempts,
+                      o.last_error AS notification_last_error
+               FROM post_notification_outbox o
+               INNER JOIN posts p ON p.id = o.post_id
+               WHERE o.channel = ?
+               ORDER BY o.created_at ASC, p.created_at ASC, p.id ASC
+               LIMIT ?""",
+            (str(channel), max(1, int(limit))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def complete_post_notifications(channel: str, post_ids: list[str]) -> None:
+    """删除已成功发送的 outbox 项。"""
+    ids = [str(post_id) for post_id in post_ids if str(post_id)]
+    if not ids:
+        return
+    with _ConnCtx() as conn:
+        conn.executemany(
+            "DELETE FROM post_notification_outbox WHERE post_id = ? AND channel = ?",
+            [(post_id, str(channel)) for post_id in ids],
+        )
+        conn.commit()
+
+
+def fail_post_notifications(channel: str, post_ids: list[str], error: str) -> None:
+    """记录发送失败，保留 outbox 项供后续抓取重试。"""
+    ids = [str(post_id) for post_id in post_ids if str(post_id)]
+    if not ids:
+        return
+    with _ConnCtx() as conn:
+        conn.executemany(
+            """UPDATE post_notification_outbox
+               SET attempts = attempts + 1, last_error = ?
+               WHERE post_id = ? AND channel = ?""",
+            [(str(error)[:1000], post_id, str(channel)) for post_id in ids],
+        )
+        conn.commit()
 
 
 def get_recent_posts(limit: int = 50, author_id: str = None, offset: int = 0) -> list:

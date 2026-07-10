@@ -12,7 +12,7 @@ import config
 import announcements
 import database
 from fetcher import XueqiuFetcher
-from notifier import notify_new_posts, notify_prices
+from notifier import deliver_post_notifications, notify_new_posts, notify_prices
 from price_fetcher import fetch_prices
 from scheduler import start_scheduler, start_price_scheduler, start_announcement_scheduler
 
@@ -43,6 +43,35 @@ def _get_json_payload():
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _webhook_channels() -> dict[str, str]:
+    return {
+        "wechat": config.WECHAT_WEBHOOK_URL,
+        "feishu": config.FEISHU_WEBHOOK_URL,
+        "dingtalk": config.DINGTALK_WEBHOOK_URL,
+    }
+
+
+def _deliver_pending_post_notifications() -> list[str]:
+    """发送 outbox 中的帖子通知，失败项保留到后续抓取重试。"""
+    errors = []
+    for channel, url in _webhook_channels().items():
+        if not url:
+            continue
+        pending_posts = database.get_pending_post_notifications(channel)
+        if not pending_posts:
+            continue
+        delivery = deliver_post_notifications(pending_posts, channel, url)
+        database.complete_post_notifications(channel, delivery["sent_ids"])
+        for failure in delivery["failures"]:
+            database.fail_post_notifications(
+                channel,
+                failure["post_ids"],
+                failure["error"],
+            )
+            errors.append(f"{channel}: {failure['error']}")
+    return errors
 
 
 def _run_on_fetcher_thread(fn, *args, **kwargs):
@@ -129,20 +158,27 @@ def do_fetch(wait_timeout: float = None):
         )
 
         new_posts = database.save_posts(all_posts)
-        _last_fetch_time = datetime.now().isoformat()
-
         if new_posts:
-            notify_new_posts(new_posts, {
-                "wechat_webhook_url": config.WECHAT_WEBHOOK_URL,
-                "feishu_webhook_url": config.FEISHU_WEBHOOK_URL,
-                "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
-            })
+            channels = [channel for channel, url in _webhook_channels().items() if url]
+            database.enqueue_post_notifications(new_posts, channels)
+            notify_new_posts(new_posts)
+        notification_errors = _deliver_pending_post_notifications()
 
         # 全部作者都失败基本可断定是会话失效/WAF 拦截而非个别作者异常，
         # 重启浏览器让下次抓取重新过 WAF；个别作者失败则保留 singleton，
         # 避免一个长期异常的作者导致每轮都重启浏览器。
         if fetch_errors and len(fetch_errors) == len(authors):
             _stop_fetcher()
+            result = {
+                "status": "error",
+                "message": "所有作者抓取失败，未更新最近抓取时间",
+                "errors": [f"{e['name']}: {e['error']}" for e in fetch_errors],
+            }
+            if notification_errors:
+                result["notification_errors"] = notification_errors
+            return result
+
+        _last_fetch_time = datetime.now().isoformat()
 
         result = {
             "status": "ok",
@@ -153,6 +189,8 @@ def do_fetch(wait_timeout: float = None):
         }
         if fetch_errors:
             result["errors"] = [f"{e['name']}: {e['error']}" for e in fetch_errors]
+        if notification_errors:
+            result["notification_errors"] = notification_errors
         return result
     except Exception as e:
         print(f"❌ 抓取失败: {e}")
@@ -323,7 +361,18 @@ def do_fetch_prices():
             "feishu_webhook_url":   config.FEISHU_WEBHOOK_URL,
             "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
         })
-        return {"status": "ok", "prices": {k: v for k, v in prices.items() if not k.startswith("_")}}
+        visible_prices = {k: v for k, v in prices.items() if not k.startswith("_")}
+        fetch_errors = prices.get("_errors", [])
+        if not visible_prices:
+            return {
+                "status": "error",
+                "message": "所有行情数据获取失败，保留原有行情",
+                "errors": fetch_errors,
+            }
+        result = {"status": "ok", "prices": visible_prices}
+        if fetch_errors:
+            result["errors"] = fetch_errors
+        return result
     except Exception as e:
         print(f"❌ 价格抓取失败: {e}")
         import traceback; traceback.print_exc()
@@ -347,6 +396,12 @@ def do_fetch_announcements():
             page_size=config.ANNOUNCEMENT_FETCH_PAGE_SIZE,
         )
         new_rows = database.save_announcements(rows)
+        if fetch_errors and len(fetch_errors) == len(watchlist):
+            return {
+                "status": "error",
+                "message": "所有关注公司公告抓取失败，未更新最近抓取时间",
+                "errors": fetch_errors,
+            }
         _last_announcement_fetch_time = datetime.now().isoformat()
         result = {
             "status": "ok",
@@ -445,6 +500,8 @@ def api_add_announcement_stock():
     keywords = data.get("keywords")
     if isinstance(keywords, str):
         keywords = [item.strip() for item in keywords.split(",") if item.strip()]
+        if not keywords:
+            keywords = None
     elif keywords is not None and not isinstance(keywords, list):
         return jsonify({"status": "error", "message": "keywords 必须是数组或逗号分隔字符串"}), 400
 

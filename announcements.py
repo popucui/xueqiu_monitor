@@ -17,6 +17,7 @@ CN_TZ = timezone(timedelta(hours=8), name="UTC+08:00")
 HKEX_BASE = "https://www1.hkexnews.hk"
 CNINFO_BASE = "https://www.cninfo.com.cn"
 CNINFO_STATIC_BASE = "https://static.cninfo.com.cn"
+MAX_PAGINATION_REQUESTS = 1000
 
 
 @dataclass(frozen=True)
@@ -119,53 +120,86 @@ def fetch_cninfo(stock: dict, from_day, to_day, page_size: int) -> list[Announce
     if not column:
         raise RuntimeError(f"不支持的巨潮市场后缀: {stock['code']}")
     org_id = resolve_cninfo_org_id(stock)
-    response = http_json(
-        f"{CNINFO_BASE}/new/hisAnnouncement/query",
-        method="POST",
-        data={
-            "pageNum": "1",
-            "pageSize": str(page_size),
-            "column": column,
-            "tabName": "fulltext",
-            "plate": "",
-            "stock": f"{code},{org_id}",
-            "searchkey": "",
-            "secid": "",
-            "category": "",
-            "trade": "",
-            "seDate": f"{from_day.isoformat()}~{to_day.isoformat()}",
-            "sortName": "",
-            "sortType": "",
-            "isHLtitle": "true",
-        },
-        headers={
-            "Referer": f"{CNINFO_BASE}/new/commonUrl/pageOfSearch?url=disclosure/list/search",
-            "X-Requested-With": "XMLHttpRequest",
-        },
-    )
+    page_size = max(1, int(page_size))
     rows = []
-    for item in response.get("announcements") or []:
-        title = clean_text(item.get("announcementTitle") or item.get("shortTitle") or "")
-        timestamp_ms = item.get("announcementTime")
-        published = ""
-        if timestamp_ms:
-            published = datetime.fromtimestamp(timestamp_ms / 1000, tz=CN_TZ).strftime("%Y-%m-%d %H:%M")
-        url = item.get("adjunctUrl") or ""
-        if url and not url.startswith(("http://", "https://")):
-            url = f"{CNINFO_STATIC_BASE}/{url.lstrip('/')}"
-        rows.append(
-            Announcement(
-                source="cninfo",
-                stock_code=stock["code"],
-                stock_name=stock["name"],
-                ann_id=str(item.get("announcementId") or url or title),
-                title=title,
-                published_at=published,
-                url=url,
-                matched_keywords=", ".join(match_keywords(title, stock.get("keywords", []))),
-            )
+    seen_ids = set()
+    previous_signature = None
+
+    for page_num in range(1, MAX_PAGINATION_REQUESTS + 1):
+        response = http_json(
+            f"{CNINFO_BASE}/new/hisAnnouncement/query",
+            method="POST",
+            data={
+                "pageNum": str(page_num),
+                "pageSize": str(page_size),
+                "column": column,
+                "tabName": "fulltext",
+                "plate": "",
+                "stock": f"{code},{org_id}",
+                "searchkey": "",
+                "secid": "",
+                "category": "",
+                "trade": "",
+                "seDate": f"{from_day.isoformat()}~{to_day.isoformat()}",
+                "sortName": "",
+                "sortType": "",
+                "isHLtitle": "true",
+            },
+            headers={
+                "Referer": f"{CNINFO_BASE}/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+                "X-Requested-With": "XMLHttpRequest",
+            },
         )
-    return rows
+        items = response.get("announcements") or []
+        signature = tuple(
+            str(item.get("announcementId") or item.get("adjunctUrl") or "")
+            for item in items
+        )
+        if page_num > 1 and items and signature == previous_signature:
+            raise RuntimeError(f"巨潮分页未前进: {stock['code']} page={page_num}")
+        previous_signature = signature
+        for item in items:
+            title = clean_text(item.get("announcementTitle") or item.get("shortTitle") or "")
+            timestamp_ms = item.get("announcementTime")
+            published = ""
+            if timestamp_ms:
+                published = datetime.fromtimestamp(float(timestamp_ms) / 1000, tz=CN_TZ).strftime("%Y-%m-%d %H:%M")
+            url = item.get("adjunctUrl") or ""
+            if url and not url.startswith(("http://", "https://")):
+                url = f"{CNINFO_STATIC_BASE}/{url.lstrip('/')}"
+            ann_id = str(item.get("announcementId") or url or title)
+            if ann_id in seen_ids:
+                continue
+            seen_ids.add(ann_id)
+            rows.append(
+                Announcement(
+                    source="cninfo",
+                    stock_code=stock["code"],
+                    stock_name=stock["name"],
+                    ann_id=ann_id,
+                    title=title,
+                    published_at=published,
+                    url=url,
+                    matched_keywords=", ".join(match_keywords(title, stock.get("keywords", []))),
+                )
+            )
+
+        total = _as_int(response.get("totalAnnouncement"))
+        total_pages = _as_int(response.get("totalpages") or response.get("totalPages"))
+        if not items:
+            return rows
+        if total is not None:
+            has_more = len(seen_ids) < total
+        elif total_pages is not None:
+            has_more = page_num < total_pages
+        elif "hasMore" in response:
+            has_more = _as_bool(response.get("hasMore"))
+        else:
+            has_more = len(items) >= page_size
+        if not has_more:
+            return rows
+
+    raise RuntimeError(f"巨潮分页超过安全上限: {stock['code']}")
 
 
 def resolve_hkex_stock_id(stock: dict) -> str:
@@ -191,52 +225,95 @@ def resolve_hkex_stock_id(stock: dict) -> str:
 def fetch_hkex(stock: dict, from_day, to_day, page_size: int) -> list[Announcement]:
     code = stock["code"].split(".", 1)[0].zfill(5)
     stock_id = resolve_hkex_stock_id(stock)
-    query = urlencode(
-        {
-            "sortDir": "0",
-            "sortByOptions": "DateTime",
-            "category": "0",
-            "market": "SEHK",
-            "stockId": stock_id,
-            "documentType": "-1",
-            "fromDate": from_day.strftime("%Y%m%d"),
-            "toDate": to_day.strftime("%Y%m%d"),
-            "title": "",
-            "searchType": "0",
-            "t1code": "-2",
-            "t2Gcode": "-2",
-            "t2code": "-2",
-            "rowRange": str(page_size),
-            "lang": "E",
-        }
-    )
-    response = http_json(
-        f"{HKEX_BASE}/search/titleSearchServlet.do?{query}",
-        headers={
-            "Referer": f"{HKEX_BASE}/search/titlesearch.xhtml?lang=en",
-            "Accept": "application/json",
-        },
-    )
+    page_size = max(1, int(page_size))
+    row_range = page_size
     rows = []
-    for item in json.loads(response.get("result") or "[]"):
-        title = clean_text(item.get("TITLE") or item.get("LONG_TEXT") or "")
-        detail = clean_text(item.get("LONG_TEXT") or "")
-        full_title = title if not detail or detail == title else f"{title} - {detail}"
-        file_link = item.get("FILE_LINK") or ""
-        url = file_link if file_link.startswith(("http://", "https://")) else f"{HKEX_BASE}{file_link}"
-        rows.append(
-            Announcement(
-                source="hkex",
-                stock_code=f"{code}.HK",
-                stock_name=stock["name"],
-                ann_id=str(item.get("NEWS_ID") or file_link or full_title),
-                title=full_title,
-                published_at=parse_hkex_date(item.get("DATE_TIME") or ""),
-                url=url,
-                matched_keywords=", ".join(match_keywords(full_title, stock.get("keywords", []))),
-            )
+    seen_ids = set()
+    previous_loaded = -1
+
+    for _ in range(MAX_PAGINATION_REQUESTS):
+        query = urlencode(
+            {
+                "sortDir": "0",
+                "sortByOptions": "DateTime",
+                "category": "0",
+                "market": "SEHK",
+                "stockId": stock_id,
+                "documentType": "-1",
+                "fromDate": from_day.strftime("%Y%m%d"),
+                "toDate": to_day.strftime("%Y%m%d"),
+                "title": "",
+                "searchType": "0",
+                "t1code": "-2",
+                "t2Gcode": "-2",
+                "t2code": "-2",
+                "rowRange": str(row_range),
+                "lang": "E",
+            }
         )
-    return rows
+        response = http_json(
+            f"{HKEX_BASE}/search/titleSearchServlet.do?{query}",
+            headers={
+                "Referer": f"{HKEX_BASE}/search/titlesearch.xhtml?lang=en",
+                "Accept": "application/json",
+            },
+        )
+        raw_result = response.get("result") or "[]"
+        items = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+        for item in items:
+            title = clean_text(item.get("TITLE") or item.get("LONG_TEXT") or "")
+            detail = clean_text(item.get("LONG_TEXT") or "")
+            full_title = title if not detail or detail == title else f"{title} - {detail}"
+            file_link = item.get("FILE_LINK") or ""
+            url = file_link if file_link.startswith(("http://", "https://")) else f"{HKEX_BASE}{file_link}"
+            ann_id = str(item.get("NEWS_ID") or file_link or full_title)
+            if ann_id in seen_ids:
+                continue
+            seen_ids.add(ann_id)
+            rows.append(
+                Announcement(
+                    source="hkex",
+                    stock_code=f"{code}.HK",
+                    stock_name=stock["name"],
+                    ann_id=ann_id,
+                    title=full_title,
+                    published_at=parse_hkex_date(item.get("DATE_TIME") or ""),
+                    url=url,
+                    matched_keywords=", ".join(match_keywords(full_title, stock.get("keywords", []))),
+                )
+            )
+
+        loaded = _as_int(response.get("loadedRecord"), len(items))
+        total = _as_int(response.get("recordCnt"))
+        has_more = _as_bool(response.get("hasNextRow")) or (
+            total is not None and loaded < total
+        )
+        if not has_more or (total is not None and loaded >= total):
+            return rows
+        if loaded <= previous_loaded:
+            raise RuntimeError(f"HKEX 分页未前进: {stock['code']} loaded={loaded}")
+        previous_loaded = loaded
+        next_range = loaded + page_size
+        if total is not None:
+            next_range = min(next_range, total)
+        if next_range <= row_range:
+            raise RuntimeError(f"HKEX 分页范围未前进: {stock['code']} rowRange={row_range}")
+        row_range = next_range
+
+    raise RuntimeError(f"HKEX 分页超过安全上限: {stock['code']}")
+
+
+def _as_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def clean_text(value: str) -> str:

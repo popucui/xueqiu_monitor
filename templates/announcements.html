@@ -113,9 +113,17 @@
             currentWatchlist = watchlist;
             const select = document.getElementById('stockFilter');
             const selected = select.value;
-            select.innerHTML = '<option value="">全部股票</option>' + watchlist.map(item => (
-                `<option value="${escapeHtml(item.code)}">${escapeHtml(item.name)} ${escapeHtml(item.code)}</option>`
-            )).join('');
+            select.replaceChildren();
+            const allOption = document.createElement('option');
+            allOption.value = '';
+            allOption.textContent = '全部股票';
+            select.appendChild(allOption);
+            watchlist.forEach(item => {
+                const option = document.createElement('option');
+                option.value = item.code || '';
+                option.textContent = `${item.name || ''} ${item.code || ''}`.trim();
+                select.appendChild(option);
+            });
             select.value = selected;
         }
 
@@ -125,15 +133,37 @@
                 container.innerHTML = '<div class="empty-state"><p>暂无关注公司</p></div>';
                 return;
             }
-            container.innerHTML = watchlist.map(item => `
-                <div class="modal-author-item">
-                    <div>
-                        <div class="modal-author-name">${escapeHtml(item.name)} ${escapeHtml(item.code)}</div>
-                        <div class="modal-author-meta">${escapeHtml(item.source)} · ${escapeHtml((item.keywords || []).join(', ') || '默认关键词')}</div>
-                    </div>
-                    <button class="btn-delete-author" onclick="deleteStock('${escapeHtml(item.code)}', '${escapeHtml(item.name)}')">删除</button>
-                </div>
-            `).join('');
+            container.replaceChildren();
+            watchlist.forEach(item => {
+                const row = document.createElement('div');
+                row.className = 'modal-author-item';
+
+                const info = document.createElement('div');
+                const name = document.createElement('div');
+                name.className = 'modal-author-name';
+                name.textContent = `${item.name || ''} ${item.code || ''}`.trim();
+                const meta = document.createElement('div');
+                meta.className = 'modal-author-meta';
+                meta.textContent = `${item.source || ''} · ${(item.keywords || []).join(', ') || '默认关键词'}`;
+                info.append(name, meta);
+
+                const deleteButton = document.createElement('button');
+                deleteButton.className = 'btn-delete-author';
+                deleteButton.textContent = '删除';
+                deleteButton.addEventListener('click', () => deleteStock(item.code, item.name));
+
+                row.append(info, deleteButton);
+                container.appendChild(row);
+            });
+        }
+
+        function safeExternalUrl(value) {
+            try {
+                const url = new URL(value || '');
+                return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+            } catch (_) {
+                return '';
+            }
         }
 
         function renderAnnouncements(rows) {
@@ -149,7 +179,7 @@
             container.innerHTML = rows.map(row => {
                 const keywords = row.matched_keywords || '未命中';
                 const keywordClass = row.matched_keywords ? 'matched' : '';
-                const safeUrl = (row.url || '').startsWith('http') ? row.url : '';
+                const safeUrl = safeExternalUrl(row.url);
                 const title = escapeHtml(row.title || '');
                 return `
                     <article class="announcement-card">

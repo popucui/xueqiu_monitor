@@ -12,9 +12,9 @@ def fmt_ts(ts):
 
 
 def notify_new_posts(posts: list, config: dict = None):
-    """推送新帖子通知"""
+    """输出新帖子并立即尝试配置中的 Webhook，返回各渠道发送结果。"""
     if not posts:
-        return
+        return {}
 
     config = config or {}
 
@@ -26,12 +26,14 @@ def notify_new_posts(posts: list, config: dict = None):
     feishu_url = config.get("feishu_webhook_url", "")
     dingtalk_url = config.get("dingtalk_webhook_url", "")
 
+    results = {}
     if wechat_url:
-        _notify_wechat(posts, wechat_url)
+        results["wechat"] = deliver_post_notifications(posts, "wechat", wechat_url)
     if feishu_url:
-        _notify_feishu(posts, feishu_url)
+        results["feishu"] = deliver_post_notifications(posts, "feishu", feishu_url)
     if dingtalk_url:
-        _notify_dingtalk(posts, dingtalk_url)
+        results["dingtalk"] = deliver_post_notifications(posts, "dingtalk", dingtalk_url)
+    return results
 
 
 def _notify_console(posts):
@@ -84,7 +86,7 @@ def _split_posts_by_size(posts, limit_bytes):
 
 
 def _post_with_retry(url: str, payload: dict, name: str, max_retries: int = 3):
-    """带指数退避重试的 Webhook POST"""
+    """带指数退避重试的 Webhook POST；成功返回 None，失败返回错误文本。"""
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(url, json=payload, timeout=5)
@@ -96,41 +98,62 @@ def _post_with_retry(url: str, payload: dict, name: str, max_retries: int = 3):
             except ValueError:
                 body = None
             if isinstance(body, dict):
-                err = body.get("errcode") or body.get("code")
-                if err:
+                err = body.get("errcode", body.get("code"))
+                if err not in (None, "", 0, "0"):
                     raise RuntimeError(f"webhook 业务错误: {body}")
-            return
+            return None
         except Exception as e:
             if attempt == max_retries:
                 print(f"  ⚠️ {name}推送失败（已重试 {max_retries} 次）: {e}")
+                return str(e)
             else:
                 wait = 2 ** (attempt - 1)  # 1s, 2s
                 print(f"  ⚠️ {name}推送失败，{wait}s 后重试（{attempt}/{max_retries}）: {e}")
                 time.sleep(wait)
 
 
-def _notify_wechat(posts, url):
-    for batch in _split_posts_by_size(posts, _WECHAT_MD_LIMIT):
-        md = _build_markdown(batch)
-        _post_with_retry(url, {"msgtype": "markdown", "markdown": {"content": md}}, "企业微信")
-
-
-def _notify_feishu(posts, url):
-    for batch in _split_posts_by_size(posts, _FEISHU_MD_LIMIT):
-        md = _build_markdown(batch)
-        _post_with_retry(url, {
+def _post_notification_payload(channel, batch):
+    md = _build_markdown(batch)
+    if channel == "wechat":
+        return {"msgtype": "markdown", "markdown": {"content": md}}
+    if channel == "feishu":
+        return {
             "msg_type": "interactive",
             "card": {
                 "header": {"title": {"tag": "plain_text", "content": f"🔔 雪球新动态 ({len(batch)} 条)"}},
                 "elements": [{"tag": "markdown", "content": md}],
             },
-        }, "飞书")
+        }
+    if channel == "dingtalk":
+        return {"msgtype": "markdown", "markdown": {"title": "雪球新动态", "text": md}}
+    raise ValueError(f"不支持的通知渠道: {channel}")
 
 
-def _notify_dingtalk(posts, url):
-    for batch in _split_posts_by_size(posts, _DINGTALK_MD_LIMIT):
-        md = _build_markdown(batch)
-        _post_with_retry(url, {"msgtype": "markdown", "markdown": {"title": "雪球新动态", "text": md}}, "钉钉")
+def deliver_post_notifications(posts, channel: str, url: str) -> dict:
+    """发送一个渠道的帖子通知，按批返回成功 ID 与失败批次。"""
+    settings = {
+        "wechat": (_WECHAT_MD_LIMIT, "企业微信"),
+        "feishu": (_FEISHU_MD_LIMIT, "飞书"),
+        "dingtalk": (_DINGTALK_MD_LIMIT, "钉钉"),
+    }
+    if channel not in settings:
+        raise ValueError(f"不支持的通知渠道: {channel}")
+
+    limit_bytes, display_name = settings[channel]
+    result = {"sent_ids": [], "failures": []}
+    for batch in _split_posts_by_size(posts, limit_bytes):
+        post_ids = [str(post.get("id") or "") for post in batch]
+        post_ids = [post_id for post_id in post_ids if post_id]
+        error = _post_with_retry(
+            url,
+            _post_notification_payload(channel, batch),
+            display_name,
+        )
+        if error is None:
+            result["sent_ids"].extend(post_ids)
+        else:
+            result["failures"].append({"post_ids": post_ids, "error": error})
+    return result
 
 
 # ==================== 商品价格推送 ====================

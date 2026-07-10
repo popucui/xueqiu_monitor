@@ -27,6 +27,7 @@ For validation:
 ```bash
 conda run -n xueqiu_monitor python -m py_compile app.py database.py fetcher.py notifier.py price_fetcher.py scheduler.py announcements.py config.py
 conda run -n xueqiu_monitor flask --app app routes
+conda run -n xueqiu_monitor python -m unittest discover -v
 ```
 
 If a temporary web server is needed for validation, use a port other than the live `WEB_PORT` when it is already occupied, and stop the temporary process afterward.
@@ -57,6 +58,7 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 - Posts are stored in `posts`, deduplicated by post `id`.
 - The singleton runs on a dedicated executor thread (`_fetcher_executor`, single-worker `ThreadPoolExecutor`) because Playwright's sync API requires greenlet thread affinity. On `_stop_fetcher()`, the executor is replaced with a fresh one to avoid a residual asyncio event loop that would block `sync_playwright().start()` on the same thread.
 - `fetch_all_authors()` returns `(posts, errors)`. A failure for one author is recorded in `errors` and the remaining authors are still fetched; already-fetched posts are always saved. `do_fetch()` restarts the singleton only when every author failed (session/WAF-level signal), and includes an `errors` list in the API response on partial failure.
+- When every configured author fails, `do_fetch()` returns `status=error` and does not advance `_last_fetch_time`, so stale data is not presented as freshly checked.
 - If `fetcher.start()` fails partway, `_get_fetcher()` calls `fetcher.stop()` before re-raising to avoid leaking Chromium processes.
 - `get_authors_summary()` returns every tracked author via `LEFT JOIN posts`, so authors with zero posts still appear in the sidebar.
 - Homepage APIs:
@@ -82,6 +84,7 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 
 - `notifier.py` splits post notifications into batches by rendered markdown size (WeChat Work 3800 bytes, DingTalk 18000, Feishu 20000) so large batches (e.g. first fetch after adding an author) are not rejected by platform limits.
 - `_post_with_retry` also checks the response body for `errcode`/`code`, because WeChat Work/DingTalk/Feishu report business failures with HTTP 200.
+- New posts are enqueued in `post_notification_outbox` per enabled channel. Successful batches are removed; failed batches retain their attempt count and error and are retried on a later Xueqiu fetch.
 
 ### Announcement Tracking
 
@@ -105,6 +108,8 @@ The app is intentionally simple: it uses one Flask process, SQLite for local sta
 Announcement results are intentionally not filtered out yet. The UI displays all fetched announcements and only marks keyword hits. The owner plans to run it for a while before deciding what to suppress.
 
 `fetch_for_watchlist()` returns `(announcements, errors)`: a failure for one stock does not block the others, and `POST /api/announcements/refresh` includes an `errors` list on partial failure.
+
+CNINFO follows numbered result pages until the reported total is loaded. HKEX follows its official load-more protocol by increasing `rowRange` until `hasNextRow` is false. If every watched stock fails, the refresh returns `status=error` without advancing the last-fetch timestamp.
 
 ## Configuration
 
@@ -142,6 +147,7 @@ Tables:
 - `commodity_prices`: price snapshots.
 - `announcement_watchlist`: tracked companies for disclosure monitoring. Primary key `code`.
 - `announcements`: fetched announcement records. Primary key `(source, ann_id)`.
+- `post_notification_outbox`: pending post Webhook deliveries. Primary key `(post_id, channel)`.
 
 When adding schema changes, prefer idempotent migration logic in `init_db()` or helper functions called by it. Preserve existing user data in `xueqiu_monitor.db`.
 

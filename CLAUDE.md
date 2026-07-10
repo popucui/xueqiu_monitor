@@ -37,6 +37,7 @@ Run:
 ```bash
 conda run -n xueqiu_monitor python -m py_compile app.py database.py fetcher.py notifier.py price_fetcher.py scheduler.py announcements.py config.py
 conda run -n xueqiu_monitor flask --app app routes
+conda run -n xueqiu_monitor python -m unittest discover -v
 ```
 
 For route tests that should not start background jobs, import the Flask app with `flask --app app ...` or use `app.test_client()`. The scheduled jobs only start in `app.py` under `if __name__ == "__main__"`.
@@ -78,6 +79,7 @@ Tables:
 - `commodity_prices`: price snapshots.
 - `announcement_watchlist`: watched companies for announcement tracking.
 - `announcements`: fetched announcements, deduplicated by `(source, ann_id)`.
+- `post_notification_outbox`: pending post Webhook deliveries, deduplicated by `(post_id, channel)`.
 
 `database.init_db()` creates missing tables and lightweight migrations. Keep migrations idempotent and preserve existing data.
 
@@ -109,6 +111,8 @@ The fetcher singleton is started on first use and only stopped on fetch failure 
 
 `fetch_all_authors()` returns `(posts, errors)`: a failure for one author is recorded in `errors` and the remaining authors are still fetched, so a partial failure never discards already-fetched posts. `do_fetch()` restarts the fetcher singleton only when every author failed (session/WAF-level failure); per-author failures keep the singleton alive. If `fetcher.start()` itself fails partway, `_get_fetcher()` calls `fetcher.stop()` before re-raising so no Chromium process leaks.
 
+If every configured author fails, `do_fetch()` returns `status=error` and does not advance `_last_fetch_time`. New posts are added to `post_notification_outbox` for each enabled Webhook channel before delivery; failed batches remain pending and are retried on a later fetch.
+
 `_stop_fetcher()` also replaces `_fetcher_executor` with a fresh `ThreadPoolExecutor`. This is necessary because `sync_playwright().start()` leaves an asyncio event loop on the executor thread; if the same thread is reused, the next `start()` raises `"using Playwright Sync API inside the asyncio loop"`. A fresh executor gets a clean thread and recovers automatically.
 
 ### Prices
@@ -137,6 +141,8 @@ Announcement page:
 - `/api/announcement-stocks/<code>`: delete watched company.
 
 Current behavior intentionally shows all announcements. Keyword matching is only marked visually; it is not used to filter announcements yet.
+
+CNINFO follows numbered pages to the reported total. HKEX increases `rowRange` according to its `hasNextRow`/`loadedRecord` response fields. If every watched stock fails, the refresh returns `status=error` without advancing the last-fetch timestamp.
 
 Default announcement watchlist:
 

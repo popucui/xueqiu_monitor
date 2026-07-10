@@ -470,9 +470,11 @@
 
                 if (data.status === 'ok') {
                     const failed = (data.errors || []).length;
+                    const notificationFailed = (data.notification_errors || []).length;
                     let msg = `✅ 抓取完成！获取 ${data.total_fetched} 条，新增 ${data.new_posts} 条`;
                     if (failed) msg += `（${failed} 个作者抓取失败）`;
-                    showToast(msg, failed ? 'error' : 'success');
+                    if (notificationFailed) msg += `（${notificationFailed} 批通知待重试）`;
+                    showToast(msg, failed || notificationFailed ? 'error' : 'success');
                     await loadData();
                 } else if (data.status === 'skipped') {
                     showToast('⏳ 上一次抓取尚未完成', 'error');
@@ -656,9 +658,17 @@
             btn.disabled = true;
             btn.textContent = '…';
             try {
-                await fetch('/api/prices/refresh', {method: 'POST'});
-                await loadPrices();
-                showToast('✅ 行情已更新', 'success');
+                const res = await fetch('/api/prices/refresh', {method: 'POST'});
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    await loadPrices();
+                    const failed = (data.errors || []).length;
+                    showToast(failed ? `⚠️ 行情已部分更新，${failed} 项失败` : '✅ 行情已更新', failed ? 'error' : 'success');
+                } else if (data.status === 'skipped') {
+                    showToast('⏳ 上一次行情抓取尚未完成', 'error');
+                } else {
+                    showToast(`❌ ${data.message || '行情刷新失败'}`, 'error');
+                }
             } catch(e) {
                 showToast('❌ 行情刷新失败', 'error');
             } finally {
