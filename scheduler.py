@@ -46,6 +46,22 @@ def start_price_scheduler(price_func, hour: int = 8, minute: int = 30):
     print(f"⏰ 行情日报任务已启动，每个工作日 {hour:02d}:{minute:02d} CST 推送")
 
 
+def start_signal_scheduler(scan_func, hour: int = 16, minute: int = 40):
+    """启动公司量价信号扫描任务（工作日 HH:MM CST，两市收盘后）"""
+    sched = _get_scheduler()
+    sched.add_job(
+        scan_func,
+        "cron",
+        day_of_week="mon-fri",
+        hour=hour,
+        minute=minute,
+        id="signal_daily",
+        replace_existing=True,
+        max_instances=1,
+    )
+    print(f"⏰ 公司信号扫描任务已启动，每个工作日 {hour:02d}:{minute:02d} CST 执行")
+
+
 def start_announcement_scheduler(fetch_func, interval_minutes: int = 60):
     """启动公告追踪后台定时任务（间隔式）"""
     sched = _get_scheduler()

@@ -61,6 +61,10 @@ def clean_html(text):
 class XueqiuFetcher:
     """多作者批量抓取器，复用单个浏览器实例"""
 
+    # 单次 API 请求超时（毫秒）。fetch 挂死会让 do_fetch 永久持有抓取锁，
+    # 之后所有定时任务都会因"上一次抓取尚未完成"被跳过
+    _API_TIMEOUT_MS = 30000
+
     def __init__(self, xq_a_token: str, xq_r_token: str):
         self.xq_a_token = xq_a_token
         self.xq_r_token = xq_r_token
@@ -151,15 +155,21 @@ class XueqiuFetcher:
           不能默认当成分页正常结束。
         """
         url = f"{path}?{urlencode(params)}"
-        payload = self._page.evaluate("""
-            async (url) => {
-                const resp = await fetch(url, {
-                    headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
-                });
-                const text = await resp.text();
-                return { status: resp.status, body: text };
-            }
-        """, url)
+        try:
+            payload = self._page.evaluate("""
+                async ({ url, timeoutMs }) => {
+                    const resp = await fetch(url, {
+                        headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" },
+                        signal: AbortSignal.timeout(timeoutMs)
+                    });
+                    const text = await resp.text();
+                    return { status: resp.status, body: text };
+                }
+            """, {"url": url, "timeoutMs": self._API_TIMEOUT_MS})
+        except Exception as e:
+            raise RuntimeError(
+                f"xueqiu api {path} 请求失败（可能超时 {self._API_TIMEOUT_MS / 1000:.0f}s）: {e}"
+            ) from e
         status = payload.get("status")
         body = payload.get("body") or ""
         try:

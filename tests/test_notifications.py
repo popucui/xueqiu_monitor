@@ -84,6 +84,24 @@ class NotificationOutboxTests(unittest.TestCase):
         self.assertEqual([], errors)
         self.assertEqual([], database.get_pending_post_notifications("wechat"))
 
+    def test_outbox_entry_dropped_after_max_attempts(self):
+        expired = database.fail_post_notifications(
+            "wechat", ["post-1"], "timeout", max_attempts=1
+        )
+
+        self.assertEqual(["post-1"], expired)
+        self.assertEqual([], database.get_pending_post_notifications("wechat"))
+
+    def test_outbox_entry_kept_below_max_attempts(self):
+        expired = database.fail_post_notifications(
+            "wechat", ["post-1"], "timeout", max_attempts=2
+        )
+
+        self.assertEqual([], expired)
+        pending = database.get_pending_post_notifications("wechat")
+        self.assertEqual(1, len(pending))
+        self.assertEqual(1, pending[0]["attempts"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,8 @@
             <span>公告追踪</span>
         </div>
         <div class="navbar-actions">
-            <a class="nav-link" href="/">返回雪球动态</a>
+            <a class="nav-link" href="/">雪球动态</a>
+            <a class="nav-link" href="/companies">公司信号</a>
             <span class="last-update" id="lastUpdate">加载中...</span>
             <button class="btn-edit-authors" onclick="openStockModal()">
                 <span class="label">⚙️ 管理公司</span>
@@ -181,9 +182,14 @@
                 const keywordClass = row.matched_keywords ? 'matched' : '';
                 const safeUrl = safeExternalUrl(row.url);
                 const title = escapeHtml(row.title || '');
+                const sentimentBadge = row.sentiment === 'positive'
+                    ? '<span class="announcement-sentiment positive">利好</span>'
+                    : (row.sentiment === 'negative'
+                        ? '<span class="announcement-sentiment negative">利空</span>' : '');
                 return `
                     <article class="announcement-card">
                         <div class="announcement-meta">
+                            ${sentimentBadge}
                             <span>${escapeHtml(row.stock_name || '')} ${escapeHtml(row.stock_code || '')}</span>
                             <span>${escapeHtml(row.published_at || '')}</span>
                             <span>${escapeHtml(row.source || '')}</span>

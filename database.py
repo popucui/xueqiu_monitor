@@ -150,10 +150,52 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_announcements_stock ON announcements(stock_code);
             CREATE INDEX IF NOT EXISTS idx_announcements_time ON announcements(published_at DESC);
+
+            CREATE TABLE IF NOT EXISTS company_watchlist (
+                code       TEXT PRIMARY KEY,
+                name       TEXT NOT NULL DEFAULT '',
+                market     TEXT NOT NULL DEFAULT '',
+                is_focus   INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                added_at   TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_klines (
+                code       TEXT NOT NULL,
+                date       TEXT NOT NULL,
+                open       REAL,
+                high       REAL,
+                low        REAL,
+                close      REAL,
+                volume     REAL,
+                fetched_at TEXT DEFAULT '',
+                PRIMARY KEY (code, date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_klines_date ON daily_klines(date);
+
+            CREATE TABLE IF NOT EXISTS daily_signals (
+                code        TEXT NOT NULL,
+                date        TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                detail      TEXT DEFAULT '',
+                created_at  TEXT DEFAULT '',
+                PRIMARY KEY (code, date, signal_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_signals_date ON daily_signals(date DESC);
         """)
         _ensure_authors_sort_order(conn)
         _ensure_default_announcement_watchlist(conn)
+        _ensure_announcements_sentiment(conn)
         conn.commit()
+
+
+def _ensure_announcements_sentiment(conn):
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(announcements)").fetchall()
+    }
+    if "sentiment" not in columns:
+        conn.execute("ALTER TABLE announcements ADD COLUMN sentiment TEXT DEFAULT ''")
 
 
 def _ensure_default_announcement_watchlist(conn):
@@ -289,11 +331,16 @@ def complete_post_notifications(channel: str, post_ids: list[str]) -> None:
         conn.commit()
 
 
-def fail_post_notifications(channel: str, post_ids: list[str], error: str) -> None:
-    """记录发送失败，保留 outbox 项供后续抓取重试。"""
+def fail_post_notifications(channel: str, post_ids: list[str], error: str,
+                            max_attempts: int = None) -> list[str]:
+    """记录发送失败，保留 outbox 项供后续抓取重试。
+
+    传入 ``max_attempts`` 时，重试次数达到上限的项（含此前积压的旧项）
+    会被移出队列，返回这些 post_id 供调用方记录日志。
+    """
     ids = [str(post_id) for post_id in post_ids if str(post_id)]
     if not ids:
-        return
+        return []
     with _ConnCtx() as conn:
         conn.executemany(
             """UPDATE post_notification_outbox
@@ -301,7 +348,21 @@ def fail_post_notifications(channel: str, post_ids: list[str], error: str) -> No
                WHERE post_id = ? AND channel = ?""",
             [(str(error)[:1000], post_id, str(channel)) for post_id in ids],
         )
+        expired_ids = []
+        if max_attempts is not None:
+            rows = conn.execute(
+                """SELECT post_id FROM post_notification_outbox
+                   WHERE channel = ? AND attempts >= ?""",
+                (str(channel), int(max_attempts)),
+            ).fetchall()
+            expired_ids = [row["post_id"] for row in rows]
+            if expired_ids:
+                conn.executemany(
+                    "DELETE FROM post_notification_outbox WHERE post_id = ? AND channel = ?",
+                    [(post_id, str(channel)) for post_id in expired_ids],
+                )
         conn.commit()
+    return expired_ids
 
 
 def get_recent_posts(limit: int = 50, author_id: str = None, offset: int = 0) -> list:
@@ -618,8 +679,8 @@ def save_announcements(announcements: list) -> list:
             conn.execute(
                 """INSERT INTO announcements
                    (source, ann_id, stock_code, stock_name, title, published_at, url,
-                    matched_keywords, fetched_at, first_seen_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    matched_keywords, fetched_at, first_seen_at, sentiment)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source, ann_id) DO UPDATE SET
                        stock_code = excluded.stock_code,
                        stock_name = excluded.stock_name,
@@ -628,7 +689,8 @@ def save_announcements(announcements: list) -> list:
                        url = excluded.url,
                        matched_keywords = excluded.matched_keywords,
                        fetched_at = excluded.fetched_at,
-                       first_seen_at = COALESCE(announcements.first_seen_at, excluded.first_seen_at)""",
+                       first_seen_at = COALESCE(announcements.first_seen_at, excluded.first_seen_at),
+                       sentiment = excluded.sentiment""",
                 (
                     source,
                     ann_id,
@@ -640,6 +702,7 @@ def save_announcements(announcements: list) -> list:
                     ann.matched_keywords,
                     now,
                     first_seen_at,
+                    getattr(ann, "sentiment", "") or "",
                 ),
             )
             if existing is None:
@@ -688,3 +751,248 @@ def get_latest_announcement_fetch_time() -> str:
             "SELECT MAX(fetched_at) AS latest_fetch FROM announcements"
         ).fetchone()
     return row["latest_fetch"] or ""
+
+
+# ==================== 公司信号 ====================
+
+def get_company_watchlist() -> list:
+    """返回公司 watchlist，重点公司优先、其余按添加顺序"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT code, name, market, is_focus, sort_order, added_at
+               FROM company_watchlist
+               ORDER BY is_focus DESC, sort_order ASC, code ASC"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_company_stock(code: str, name: str, market: str, is_focus: bool = False) -> bool:
+    """添加 watchlist 公司，成功返回 True，已存在返回 False"""
+    code = (code or "").strip().upper()
+    name = (name or "").strip()
+    market = (market or "").strip().upper()
+    if not code or not name or market not in {"A", "HK"}:
+        return False
+    now = datetime.now().isoformat()
+    with _ConnCtx() as conn:
+        order_row = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM company_watchlist"
+        ).fetchone()
+        try:
+            conn.execute(
+                """INSERT INTO company_watchlist
+                   (code, name, market, is_focus, sort_order, added_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (code, name, market, 1 if is_focus else 0,
+                 int(order_row["next_order"]), now),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def delete_company_stock(code: str) -> bool:
+    """删除 watchlist 公司。历史 K 线与信号保留，返回 True。"""
+    code = (code or "").strip().upper()
+    if not code:
+        return False
+    with _ConnCtx() as conn:
+        conn.execute("DELETE FROM company_watchlist WHERE code = ?", (code,))
+        conn.commit()
+    return True
+
+
+def set_company_focus(code: str, is_focus: bool) -> bool:
+    """设置/取消重点标记，公司不存在返回 False"""
+    code = (code or "").strip().upper()
+    if not code:
+        return False
+    with _ConnCtx() as conn:
+        cursor = conn.execute(
+            "UPDATE company_watchlist SET is_focus = ? WHERE code = ?",
+            (1 if is_focus else 0, code),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def upsert_klines(code: str, klines: list) -> int:
+    """按 (code, date) upsert 日 K 线，返回写入条数。
+
+    klines 元素为 {"date", "open", "high", "low", "close", "volume"}，
+    date 为 YYYY-MM-DD 字符串。
+    """
+    if not code or not klines:
+        return 0
+    now = datetime.now().isoformat()
+    written = 0
+    with _ConnCtx() as conn:
+        for k in klines:
+            date = str(k.get("date") or "").strip()
+            if not date:
+                continue
+            conn.execute(
+                """INSERT INTO daily_klines
+                   (code, date, open, high, low, close, volume, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(code, date) DO UPDATE SET
+                       open = excluded.open,
+                       high = excluded.high,
+                       low = excluded.low,
+                       close = excluded.close,
+                       volume = excluded.volume,
+                       fetched_at = excluded.fetched_at""",
+                (code.strip().upper(), date, k.get("open"), k.get("high"),
+                 k.get("low"), k.get("close"), k.get("volume"), now),
+            )
+            written += 1
+        conn.commit()
+    return written
+
+
+def get_klines(code: str, limit: int = 250) -> list:
+    """返回某公司最近 N 根日 K 线，按日期升序（旧→新）"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT code, date, open, high, low, close, volume
+               FROM daily_klines WHERE code = ?
+               ORDER BY date DESC LIMIT ?""",
+            ((code or "").strip().upper(), max(1, int(limit))),
+        ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def get_latest_klines() -> dict:
+    """返回 {code: 最新K线}，含 date/close/change_pct（相对前收盘）"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT k.code, k.date, k.close, p.close AS prev_close
+               FROM daily_klines k
+               INNER JOIN (
+                   SELECT code, MAX(date) AS max_date FROM daily_klines GROUP BY code
+               ) latest ON k.code = latest.code AND k.date = latest.max_date
+               LEFT JOIN daily_klines p
+                   ON p.code = k.code
+                  AND p.date = (SELECT MAX(date) FROM daily_klines
+                                WHERE code = k.code AND date < k.date)"""
+        ).fetchall()
+    result = {}
+    for row in rows:
+        close, prev_close = row["close"], row["prev_close"]
+        change_pct = None
+        if close and prev_close:
+            change_pct = round((close - prev_close) / prev_close * 100, 2)
+        result[row["code"]] = {
+            "date": row["date"],
+            "close": close,
+            "change_pct": change_pct,
+        }
+    return result
+
+
+def get_kline_counts(codes: list) -> dict:
+    """返回 {code: 已存K线条数}，用于判断哪些公司需要预热"""
+    wanted = [(code or "").strip().upper() for code in codes if str(code).strip()]
+    if not wanted:
+        return {}
+    placeholders = ",".join("?" for _ in wanted)
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            f"SELECT code, COUNT(*) AS total FROM daily_klines "
+            f"WHERE code IN ({placeholders}) GROUP BY code",
+            wanted,
+        ).fetchall()
+    return {row["code"]: int(row["total"]) for row in rows}
+
+
+def save_signals(signals: list) -> list:
+    """保存信号列表，返回首次入库的信号。
+
+    signals 元素为 {"code", "date", "signal_type", "detail"}；
+    (code, date, signal_type) 冲突视为已存在，不重复计入新增。
+    """
+    if not signals:
+        return []
+    new_rows = []
+    now = datetime.now().isoformat()
+    with _ConnCtx() as conn:
+        for s in signals:
+            code = str(s.get("code") or "").strip().upper()
+            date = str(s.get("date") or "").strip()
+            signal_type = str(s.get("signal_type") or "").strip()
+            if not code or not date or not signal_type:
+                continue
+            existing = conn.execute(
+                "SELECT 1 FROM daily_signals WHERE code = ? AND date = ? AND signal_type = ?",
+                (code, date, signal_type),
+            ).fetchone()
+            try:
+                conn.execute(
+                    """INSERT INTO daily_signals
+                       (code, date, signal_type, detail, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (code, date, signal_type, s.get("detail", ""), now),
+                )
+            except sqlite3.IntegrityError:
+                continue
+            if existing is None:
+                new_rows.append(dict(s, code=code))
+        conn.commit()
+    return new_rows
+
+
+def get_signals(date: str = None, limit: int = 200) -> list:
+    """返回信号列表（带公司名称与重点标记），新日期在前；
+    同日按形态优先级排序：放量上涨 → 缩量下跌·底部 → 横盘企稳 → 缩量下跌"""
+    order_case = ("CASE s.signal_type WHEN 'high_vol_up' THEN 0 "
+                  "WHEN 'low_vol_bottom' THEN 1 "
+                  "WHEN 'consolidation' THEN 2 ELSE 3 END")
+    with _ConnCtx() as conn:
+        if date:
+            rows = conn.execute(
+                f"""SELECT s.*, w.name, w.is_focus
+                   FROM daily_signals s
+                   LEFT JOIN company_watchlist w ON w.code = s.code
+                   WHERE s.date = ?
+                   ORDER BY s.date DESC, {order_case}, w.is_focus DESC, s.code ASC
+                   LIMIT ?""",
+                (date, max(1, int(limit))),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""SELECT s.*, w.name, w.is_focus
+                   FROM daily_signals s
+                   LEFT JOIN company_watchlist w ON w.code = s.code
+                   ORDER BY s.date DESC, {order_case}, w.is_focus DESC, s.code ASC
+                   LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_signal_dates(limit: int = 30) -> list:
+    """返回最近有信号的日期列表（降序），供页面日期筛选"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT date FROM daily_signals ORDER BY date DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [row["date"] for row in rows]
+
+
+def has_recent_signal(code: str, signal_type: str, days: int, before_date: str) -> bool:
+    """判断 (before_date 之前 days 天内) 是否已出现过同公司同形态信号，
+    用于推送去重抑制（before_date 当天不计入）"""
+    code = (code or "").strip().upper()
+    if not code or days <= 0:
+        return False
+    with _ConnCtx() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM daily_signals
+               WHERE code = ? AND signal_type = ?
+                 AND date < ? AND date >= date(?, ?)
+               LIMIT 1""",
+            (code, signal_type, before_date, before_date, f"-{int(days)} days"),
+        ).fetchone()
+    return row is not None

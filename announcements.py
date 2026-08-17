@@ -30,6 +30,45 @@ class Announcement:
     published_at: str
     url: str
     matched_keywords: str
+    sentiment: str = ""
+
+
+# 公告标题利好/利空关键词（A股中文 + 港股英文公告常见措辞）。
+# 同时命中时按"负面优先"归类，宁可多提醒不漏风险。
+POSITIVE_KEYWORDS = (
+    "回购", "增持", "业绩预增", "扭亏", "中标", "重大合同", "签订合同",
+    "分红", "派息", "利润分配", "股权激励", "员工持股", "业绩快报预增",
+    "repurchase", "buyback", "dividend", "positive profit alert",
+    "grant of shares",
+)
+NEGATIVE_KEYWORDS = (
+    "减持", "立案", "调查", "处罚", "警示函", "监管函", "业绩预减", "预亏",
+    "亏损", "退市", "质押", "冻结", "违规", "诉讼", "仲裁", "商誉减值",
+    "终止上市", "停牌", "盈利警告",
+    "profit warning", "negative profit alert", "investigation", "penalty",
+    "litigation", "delisting",
+)
+
+
+# 正面豁免词：优先于负面判定。HKEX 公告标题尾部固定带分类标签
+# （如 "[Profit Warning / Inside Information]"），正文却是利好披露
+# （IMPROVEMENT / PROFIT ALERT）；"解除质押/冻结"也容易被"质押/冻结"误伤。
+POSITIVE_EXEMPTIONS = (
+    "estimated improvement", "profit alert", "positive profit alert",
+    "业绩预增", "扭亏", "解除质押", "解除冻结",
+)
+
+
+def classify_sentiment(title: str) -> str:
+    """按标题关键词判定利好/利空：'positive' / 'negative' / ''（中性）。"""
+    lower_title = (title or "").lower()
+    if any(keyword.lower() in lower_title for keyword in POSITIVE_EXEMPTIONS):
+        return "positive"
+    if any(keyword.lower() in lower_title for keyword in NEGATIVE_KEYWORDS):
+        return "negative"
+    if any(keyword.lower() in lower_title for keyword in POSITIVE_KEYWORDS):
+        return "positive"
+    return ""
 
 
 def http_json(
@@ -181,6 +220,7 @@ def fetch_cninfo(stock: dict, from_day, to_day, page_size: int) -> list[Announce
                     published_at=published,
                     url=url,
                     matched_keywords=", ".join(match_keywords(title, stock.get("keywords", []))),
+                    sentiment=classify_sentiment(title),
                 )
             )
 
@@ -280,6 +320,7 @@ def fetch_hkex(stock: dict, from_day, to_day, page_size: int) -> list[Announceme
                     published_at=parse_hkex_date(item.get("DATE_TIME") or ""),
                     url=url,
                     matched_keywords=", ".join(match_keywords(full_title, stock.get("keywords", []))),
+                    sentiment=classify_sentiment(full_title),
                 )
             )
 

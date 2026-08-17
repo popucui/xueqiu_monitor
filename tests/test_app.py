@@ -51,6 +51,37 @@ class RefreshStatusTests(unittest.TestCase):
         self.assertEqual("error", result["status"])
         self.assertEqual(["all down"], result["errors"])
 
+    def test_db_failure_does_not_restart_fetcher(self):
+        class OkFetcher:
+            def fetch_all_authors(self, *args, **kwargs):
+                return [], []
+
+        with patch.object(app, "_get_fetcher", return_value=OkFetcher()), \
+             patch.object(app, "_run_on_fetcher_thread", side_effect=lambda fn, *a, **kw: fn(*a, **kw)), \
+             patch.object(app.database, "get_db_authors", return_value=[{"user_id": "1", "name": "A"}]), \
+             patch.object(app.database, "get_authors_summary", return_value=[]), \
+             patch.object(app.database, "save_posts", side_effect=RuntimeError("sqlite locked")), \
+             patch.object(app, "_stop_fetcher") as stop_fetcher:
+            result = app.do_fetch(wait_timeout=0)
+
+        self.assertEqual("error", result["status"])
+        stop_fetcher.assert_not_called()
+
+    def test_fetcher_failure_restarts_fetcher(self):
+        class OkFetcher:
+            def fetch_all_authors(self, *args, **kwargs):
+                return [], []
+
+        with patch.object(app, "_get_fetcher", return_value=OkFetcher()), \
+             patch.object(app, "_run_on_fetcher_thread", side_effect=RuntimeError("browser crashed")), \
+             patch.object(app.database, "get_db_authors", return_value=[{"user_id": "1", "name": "A"}]), \
+             patch.object(app.database, "get_authors_summary", return_value=[]), \
+             patch.object(app, "_stop_fetcher") as stop_fetcher:
+            result = app.do_fetch(wait_timeout=0)
+
+        self.assertEqual("error", result["status"])
+        stop_fetcher.assert_called_once()
+
 
 class AnnouncementStockApiTests(unittest.TestCase):
     def test_blank_keyword_string_uses_defaults(self):

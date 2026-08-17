@@ -88,5 +88,50 @@ class AnnouncementPaginationTests(unittest.TestCase):
         self.assertEqual(["1", "2"], [row.ann_id for row in rows])
 
 
+class SentimentClassificationTests(unittest.TestCase):
+    def test_positive_keywords(self):
+        self.assertEqual("positive", announcements.classify_sentiment("关于回购公司股份的进展公告"))
+        self.assertEqual("positive", announcements.classify_sentiment("Repurchase of Shares"))
+
+    def test_negative_keywords(self):
+        self.assertEqual("negative", announcements.classify_sentiment("关于股东减持计划的公告"))
+        self.assertEqual("negative", announcements.classify_sentiment("Profit Warning Announcement"))
+
+    def test_negative_wins_on_conflict(self):
+        self.assertEqual("negative", announcements.classify_sentiment("回购股份暨立案调查进展"))
+
+    def test_neutral(self):
+        self.assertEqual("", announcements.classify_sentiment("2026年半年度报告"))
+
+    def test_save_and_read_sentiment(self):
+        import tempfile
+        from pathlib import Path
+        import database
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(database, "_DB_PATH", str(Path(temp_dir) / "test.db")):
+                database.init_db()
+                ann = announcements.Announcement(
+                    source="cninfo", stock_code="600001.SH", stock_name="测试",
+                    ann_id="a1", title="关于回购公司股份的公告",
+                    published_at="2026-08-08 10:00", url="",
+                    matched_keywords="", sentiment="positive",
+                )
+                self.assertEqual(1, len(database.save_announcements([ann])))
+                rows = database.get_recent_announcements()
+                self.assertEqual("positive", rows[0]["sentiment"])
+
+    def test_exemption_for_release_pledge(self):
+        self.assertEqual("positive", announcements.classify_sentiment("关于股东部分股份解除质押的公告"))
+
+    def test_exemption_for_hkex_profit_alert_tag(self):
+        title = ("PROFIT ALERT - Announcements and Notices - "
+                 "[Profit Warning / Inside Information]")
+        self.assertEqual("positive", announcements.classify_sentiment(title))
+
+    def test_real_profit_warning_still_negative(self):
+        self.assertEqual("negative", announcements.classify_sentiment(
+            "盈利警告 - Announcements and Notices - [Profit Warning / Inside Information]"))
+
+
 if __name__ == "__main__":
     unittest.main()

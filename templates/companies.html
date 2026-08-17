@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>公司信号</title>
+    <meta name="description" content="公司 watchlist 与每日量价信号">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="navbar-brand">
+            <div class="icon">📈</div>
+            <span>公司信号</span>
+        </div>
+        <div class="navbar-actions">
+            <a class="nav-link" href="/">雪球动态</a>
+            <a class="nav-link" href="/announcements">公告追踪</a>
+            <span class="last-update" id="lastScan">加载中...</span>
+            <button class="btn-edit-authors" onclick="openCompanyModal()">
+                <span class="label">⚙️ 管理公司</span>
+            </button>
+            <button class="btn-refresh" id="btnRefresh" onclick="scanSignals()">
+                <span class="spinner"></span>
+                <span class="label">🔄 扫描信号</span>
+            </button>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="announcements-toolbar">
+            <div>
+                <h1 class="posts-title">量价信号</h1>
+                <div class="announcements-subtitle">每个交易日收盘后自动检测：缩量下跌、横盘企稳、放量上涨。推送仅限重点公司。</div>
+            </div>
+            <select id="signalDateFilter" class="announcement-filter" onchange="loadSignals()">
+                <option value="">最近信号</option>
+            </select>
+        </div>
+        <div id="signalList">
+            <div class="empty-state">
+                <div class="icon">📡</div>
+                <p>正在加载信号...</p>
+            </div>
+        </div>
+
+        <h1 class="posts-title company-list-title">Watchlist（<span id="companyCount">0</span> 家）</h1>
+        <div id="companyList">
+            <div class="empty-state">
+                <div class="icon">📡</div>
+                <p>正在加载 watchlist...</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <div class="modal-overlay" id="companyModal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2>管理关注公司</h2>
+                <button class="modal-close" onclick="closeCompanyModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-section-title">添加新公司</div>
+                <div class="add-author-form announcement-stock-form">
+                    <input type="text" id="newCompanyCode" placeholder="代码，如 02400.HK 或 601872.SH" />
+                    <input type="text" id="newCompanyName" placeholder="名称，如 心动公司" />
+                    <select id="newCompanyMarket" class="announcement-source-select">
+                        <option value="HK">港股</option>
+                        <option value="A">A 股</option>
+                    </select>
+                    <label class="company-focus-label">
+                        <input type="checkbox" id="newCompanyFocus" /> 重点
+                    </label>
+                    <button class="btn-add-author" onclick="addCompany()">添加</button>
+                </div>
+                <div class="modal-divider"></div>
+                <div class="modal-section-title">当前公司（⭐ 为重点，仅重点推送信号）</div>
+                <div id="modalCompanyList"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentCompanies = [];
+        let signalLabels = {};
+
+        function escapeHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast show ${type}`;
+            setTimeout(() => { toast.className = 'toast'; }, 2500);
+        }
+
+        function fmtChange(pct) {
+            if (pct == null) return '—';
+            const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : '');
+            const sign = pct > 0 ? '▲' : (pct < 0 ? '▼' : '');
+            return `<span class="price-change ${cls}">${sign} ${Math.abs(pct).toFixed(2)}%</span>`;
+        }
+
+        async function loadAll() {
+            await Promise.all([loadCompanies(), loadSignals()]);
+        }
+
+        async function loadCompanies() {
+            try {
+                const res = await fetch('/api/companies');
+                const data = await res.json();
+                currentCompanies = data.companies || [];
+                renderCompanies(currentCompanies);
+                renderModalCompanies(currentCompanies);
+                const last = data.last_scan ? new Date(data.last_scan).toLocaleString('zh-CN') : '尚未扫描';
+                document.getElementById('lastScan').textContent = `最近扫描：${last}`;
+            } catch (e) {
+                console.error('watchlist 加载失败:', e);
+                document.getElementById('companyList').innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">⚠️</div>
+                        <p>加载失败，请稍后重试</p>
+                    </div>`;
+            }
+        }
+
+        function renderCompanies(companies) {
+            document.getElementById('companyCount').textContent = companies.length;
+            const container = document.getElementById('companyList');
+            if (!companies.length) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">🏢</div>
+                        <p>watchlist 为空，点击右上角「管理公司」添加。</p>
+                    </div>`;
+                return;
+            }
+            container.innerHTML = `
+                <table class="company-table">
+                    <thead>
+                        <tr>
+                            <th></th><th>代码</th><th>名称</th><th>市场</th>
+                            <th>最新收盘</th><th>涨跌</th><th>K线日期</th><th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${companies.map(item => `
+                            <tr class="${item.is_focus ? 'company-row-focus' : ''}">
+                                <td>${item.is_focus ? '⭐' : ''}</td>
+                                <td>${escapeHtml(item.code || '')}</td>
+                                <td>${escapeHtml(item.name || '')}</td>
+                                <td>${item.market === 'HK' ? '港股' : 'A股'}</td>
+                                <td>${item.last_close != null ? item.last_close : '—'}</td>
+                                <td>${fmtChange(item.last_change_pct)}</td>
+                                <td>${escapeHtml(item.last_date || '—')}</td>
+                                <td><button class="btn-delete-author" onclick="deleteCompany('${escapeHtml(item.code)}', '${escapeHtml(item.name)}')">删除</button></td>
+                            </tr>`).join('')}
+                    </tbody>
+                </table>`;
+        }
+
+        function renderModalCompanies(companies) {
+            const container = document.getElementById('modalCompanyList');
+            if (!companies.length) {
+                container.innerHTML = '<div class="empty-state"><p>暂无关注公司</p></div>';
+                return;
+            }
+            container.replaceChildren();
+            companies.forEach(item => {
+                const row = document.createElement('div');
+                row.className = 'modal-author-item';
+
+                const info = document.createElement('div');
+                const name = document.createElement('div');
+                name.className = 'modal-author-name';
+                name.textContent = `${item.is_focus ? '⭐ ' : ''}${item.name || ''} ${item.code || ''}`;
+                const meta = document.createElement('div');
+                meta.className = 'modal-author-meta';
+                meta.textContent = item.market === 'HK' ? '港股' : 'A股';
+                info.append(name, meta);
+
+                const actions = document.createElement('div');
+                actions.className = 'company-modal-actions';
+                const focusButton = document.createElement('button');
+                focusButton.className = item.is_focus ? 'btn-focus active' : 'btn-focus';
+                focusButton.textContent = item.is_focus ? '★ 重点' : '☆ 设重点';
+                focusButton.addEventListener('click', () => toggleFocus(item.code, !item.is_focus));
+                const deleteButton = document.createElement('button');
+                deleteButton.className = 'btn-delete-author';
+                deleteButton.textContent = '删除';
+                deleteButton.addEventListener('click', () => deleteCompany(item.code, item.name));
+                actions.append(focusButton, deleteButton);
+
+                row.append(info, actions);
+                container.appendChild(row);
+            });
+        }
+
+        async function loadSignals() {
+            try {
+                const date = document.getElementById('signalDateFilter').value;
+                const params = new URLSearchParams({limit: '200'});
+                if (date) params.set('date', date);
+                const res = await fetch(`/api/signals?${params}`);
+                const data = await res.json();
+                signalLabels = data.labels || {};
+                renderDateFilter(data.dates || []);
+                renderSignals(data.signals || []);
+            } catch (e) {
+                console.error('信号加载失败:', e);
+                document.getElementById('signalList').innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">⚠️</div>
+                        <p>加载失败，请稍后重试</p>
+                    </div>`;
+            }
+        }
+
+        function renderDateFilter(dates) {
+            const select = document.getElementById('signalDateFilter');
+            const selected = select.value;
+            select.replaceChildren();
+            const allOption = document.createElement('option');
+            allOption.value = '';
+            allOption.textContent = '最近信号';
+            select.appendChild(allOption);
+            dates.forEach(d => {
+                const option = document.createElement('option');
+                option.value = d;
+                option.textContent = d;
+                select.appendChild(option);
+            });
+            select.value = selected;
+        }
+
+        function xueqiuUrl(code) {
+            const m = /^(\d{5,6})\.(SH|SZ|BJ|HK)$/.exec(code || '');
+            if (!m) return '';
+            const num = m[1], market = m[2];
+            const symbol = market === 'HK' ? num : market + num;
+            return `https://xueqiu.com/S/${symbol}`;
+        }
+
+        function renderSignals(rows) {
+            const container = document.getElementById('signalList');
+            if (!rows.length) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">📭</div>
+                        <p>暂无信号。添加公司后点击「扫描信号」获取数据。</p>
+                    </div>`;
+                return;
+            }
+            container.innerHTML = rows.map(row => {
+                const label = signalLabels[row.signal_type] || row.signal_type;
+                const xqUrl = xueqiuUrl(row.code);
+                const priceHtml = row.last_close != null
+                    ? `<span class="signal-price">${row.last_close} ${fmtChange(row.last_change_pct)}</span>`
+                    : '';
+                return `
+                    <article class="signal-card">
+                        <div class="signal-meta">
+                            <span class="signal-badge ${escapeHtml(row.signal_type)}">${escapeHtml(label)}</span>
+                            ${row.is_focus ? '<span class="signal-focus">⭐ 重点</span>' : ''}
+                            <span>${escapeHtml(row.name || '')} ${escapeHtml(row.code || '')}</span>
+                            ${priceHtml}
+                            <span>${escapeHtml(row.date || '')}</span>
+                            ${xqUrl ? `<a class="signal-xq-link" href="${escapeHtml(xqUrl)}" target="_blank" rel="noopener noreferrer">雪球 ↗</a>` : ''}
+                        </div>
+                        <div class="signal-detail">${escapeHtml(row.detail || '')}</div>
+                    </article>`;
+            }).join('');
+        }
+
+        async function scanSignals() {
+            const btn = document.getElementById('btnRefresh');
+            btn.disabled = true;
+            btn.classList.add('loading');
+            try {
+                const res = await fetch('/api/signals/refresh', {method: 'POST'});
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    const failed = (data.errors || []).length;
+                    let msg = `✅ 扫描完成：新增 ${data.new_signals || 0} 条信号，推送 ${data.pushed || 0} 条`;
+                    if (failed) msg += `（${failed} 家公司抓取失败）`;
+                    showToast(msg, failed ? 'error' : 'success');
+                    await loadAll();
+                } else if (data.status === 'skipped') {
+                    showToast('⏳ 上一次扫描尚未完成', 'error');
+                } else {
+                    showToast(`❌ ${data.message || '扫描失败'}`, 'error');
+                }
+            } catch (e) {
+                showToast('❌ 扫描失败', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('loading');
+            }
+        }
+
+        function openCompanyModal() {
+            renderModalCompanies(currentCompanies);
+            document.getElementById('companyModal').classList.add('show');
+        }
+
+        function closeCompanyModal() {
+            document.getElementById('companyModal').classList.remove('show');
+        }
+
+        document.getElementById('newCompanyCode').addEventListener('input', e => {
+            const code = e.target.value.trim().toUpperCase();
+            if (code.endsWith('.HK')) document.getElementById('newCompanyMarket').value = 'HK';
+            else if (code.endsWith('.SH') || code.endsWith('.SZ') || code.endsWith('.BJ')) {
+                document.getElementById('newCompanyMarket').value = 'A';
+            }
+        });
+
+        async function addCompany() {
+            const codeEl = document.getElementById('newCompanyCode');
+            const nameEl = document.getElementById('newCompanyName');
+            const payload = {
+                code: codeEl.value.trim().toUpperCase(),
+                name: nameEl.value.trim(),
+                market: document.getElementById('newCompanyMarket').value,
+                is_focus: document.getElementById('newCompanyFocus').checked,
+            };
+            if (!payload.code || !payload.name) {
+                showToast('❌ 请填写代码和名称', 'error');
+                return;
+            }
+            const res = await fetch('/api/company-stocks', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast('✅ 已添加公司', 'success');
+                codeEl.value = '';
+                nameEl.value = '';
+                document.getElementById('newCompanyFocus').checked = false;
+                await loadCompanies();
+            } else {
+                showToast(`❌ ${data.message || '添加失败'}`, 'error');
+            }
+        }
+
+        async function toggleFocus(code, focus) {
+            const res = await fetch(`/api/company-stocks/${encodeURIComponent(code)}/focus`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({is_focus: focus}),
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast(focus ? '⭐ 已设为重点' : '已取消重点', 'success');
+                await loadCompanies();
+            } else {
+                showToast(`❌ ${data.message || '操作失败'}`, 'error');
+            }
+        }
+
+        async function deleteCompany(code, name) {
+            if (!confirm(`确定删除「${name} ${code}」？历史K线与信号会保留。`)) return;
+            const res = await fetch(`/api/company-stocks/${encodeURIComponent(code)}`, {method: 'DELETE'});
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast('✅ 已删除公司', 'success');
+                await loadCompanies();
+            } else {
+                showToast(`❌ ${data.message || '删除失败'}`, 'error');
+            }
+        }
+
+        loadAll();
+    </script>
+</body>
+</html>

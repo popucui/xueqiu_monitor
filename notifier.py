@@ -218,3 +218,68 @@ def notify_prices(prices: dict, config: dict = None):
             {"msgtype": "markdown", "markdown": {"title": "早盘行情速报", "text": md}},
             "钉钉(价格)",
         )
+
+
+# ==================== 公司信号推送 ====================
+
+_SIGNAL_EMOJI = {
+    "high_vol_up": "🚀",
+    "low_vol_bottom": "🎯",
+    "consolidation": "🛡️",
+    "low_vol_down": "🔻",
+}
+
+
+def _build_signal_markdown(signals: list) -> str:
+    from signals import SIGNAL_LABELS
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"## 📈 公司量价信号 · {now}（{len(signals)} 条，仅重点公司）\n"]
+    by_type = {}
+    for s in signals:
+        by_type.setdefault(s.get("signal_type", ""), []).append(s)
+    for signal_type in ("high_vol_up", "low_vol_bottom", "consolidation", "low_vol_down"):
+        group = by_type.get(signal_type) or []
+        if not group:
+            continue
+        label = SIGNAL_LABELS.get(signal_type, signal_type)
+        lines.append(f"**{_SIGNAL_EMOJI.get(signal_type, '📌')} {label}**")
+        for s in group:
+            name = s.get("name") or s.get("code")
+            lines.append(f"- **{name}** `{s.get('code')}` {s.get('detail', '')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def notify_signals(signals: list, config: dict = None):
+    """推送公司信号到配置的 Webhook。调用方负责只传重点公司信号。"""
+    if not signals:
+        return
+    config = config or {}
+    md = _build_signal_markdown(signals)
+
+    print(md)
+
+    wechat_url   = config.get("wechat_webhook_url", "")
+    feishu_url   = config.get("feishu_webhook_url", "")
+    dingtalk_url = config.get("dingtalk_webhook_url", "")
+
+    if wechat_url:
+        _post_with_retry(
+            wechat_url,
+            {"msgtype": "markdown", "markdown": {"content": md}},
+            "企业微信(信号)",
+        )
+    if feishu_url:
+        _post_with_retry(feishu_url, {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"tag": "plain_text", "content": f"📈 公司量价信号 ({len(signals)} 条)"}},
+                "elements": [{"tag": "markdown", "content": md}],
+            },
+        }, "飞书(信号)")
+    if dingtalk_url:
+        _post_with_retry(
+            dingtalk_url,
+            {"msgtype": "markdown", "markdown": {"title": "公司量价信号", "text": md}},
+            "钉钉(信号)",
+        )

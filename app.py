@@ -11,19 +11,24 @@ from flask import Flask, render_template, jsonify, request
 import config
 import announcements
 import database
+import signals
 from fetcher import XueqiuFetcher
-from notifier import deliver_post_notifications, notify_new_posts, notify_prices
+from notifier import (deliver_post_notifications, notify_new_posts, notify_prices,
+                      notify_signals)
 from price_fetcher import fetch_prices
-from scheduler import start_scheduler, start_price_scheduler, start_announcement_scheduler
+from scheduler import (start_scheduler, start_price_scheduler,
+                       start_announcement_scheduler, start_signal_scheduler)
 
 app = Flask(__name__)
 
 # 全局状态
 _last_fetch_time = None
 _last_announcement_fetch_time = None
+_last_signal_scan_time = None
 _fetch_lock = threading.Lock()
 _price_fetch_lock = threading.Lock()
 _announcement_fetch_lock = threading.Lock()
+_signal_scan_lock = threading.Lock()
 _USER_ID_RE = re.compile(r"^\d{1,32}$")
 _ANNOUNCEMENT_CODE_RE = re.compile(r"^\d{5}\.HK$|^\d{6}\.(SH|SZ|BJ)$")
 _fetcher_singleton = None
@@ -65,12 +70,18 @@ def _deliver_pending_post_notifications() -> list[str]:
         delivery = deliver_post_notifications(pending_posts, channel, url)
         database.complete_post_notifications(channel, delivery["sent_ids"])
         for failure in delivery["failures"]:
-            database.fail_post_notifications(
+            expired_ids = database.fail_post_notifications(
                 channel,
                 failure["post_ids"],
                 failure["error"],
+                max_attempts=config.NOTIFICATION_MAX_ATTEMPTS,
             )
             errors.append(f"{channel}: {failure['error']}")
+            if expired_ids:
+                print(
+                    f"⚠️ {channel} 通知重试 {config.NOTIFICATION_MAX_ATTEMPTS} 次仍失败，"
+                    f"放弃 {len(expired_ids)} 条: {', '.join(expired_ids)}"
+                )
     return errors
 
 
@@ -140,7 +151,6 @@ def do_fetch(wait_timeout: float = None):
         return {"status": "skipped", "reason": "already running"}
 
     try:
-        fetcher = _get_fetcher()
         db_authors = database.get_db_authors()
         authors = [{"id": a["user_id"], "name": a["name"]} for a in db_authors]
         last_post_at = {
@@ -149,13 +159,20 @@ def do_fetch(wait_timeout: float = None):
         }
         since_dt = datetime.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
         since_ms = int(since_dt.timestamp() * 1000)
-        all_posts, fetch_errors = _run_on_fetcher_thread(
-            fetcher.fetch_all_authors,
-            authors,
-            since_ms=since_ms,
-            page_size=config.POST_FETCH_PAGE_SIZE,
-            last_post_at=last_post_at,
-        )
+        try:
+            fetcher = _get_fetcher()
+            all_posts, fetch_errors = _run_on_fetcher_thread(
+                fetcher.fetch_all_authors,
+                authors,
+                since_ms=since_ms,
+                page_size=config.POST_FETCH_PAGE_SIZE,
+                last_post_at=last_post_at,
+            )
+        except Exception:
+            # 只有浏览器/抓取器层面的失败才需要重启 singleton；
+            # DB、通知等环节的错误与 Chromium 会话无关，重启纯属浪费
+            _stop_fetcher()
+            raise
 
         new_posts = database.save_posts(all_posts)
         if new_posts:
@@ -196,7 +213,6 @@ def do_fetch(wait_timeout: float = None):
         print(f"❌ 抓取失败: {e}")
         import traceback
         traceback.print_exc()
-        _stop_fetcher()
         return {"status": "error", "message": str(e)}
     finally:
         _fetch_lock.release()
@@ -381,6 +397,21 @@ def do_fetch_prices():
         _price_fetch_lock.release()
 
 
+def _sync_focus_to_announcement_watchlist() -> int:
+    """把 company_watchlist 的重点公司自动纳入公告追踪（单向增加，不自动移除）。"""
+    existing = {item["code"] for item in database.get_announcement_watchlist()}
+    added = 0
+    for company in database.get_company_watchlist():
+        if not company.get("is_focus") or company["code"] in existing:
+            continue
+        source = "hkex" if company["market"] == "HK" else "cninfo"
+        if database.add_announcement_stock(company["code"], company["name"], source):
+            added += 1
+    if added:
+        print(f"📌 已将 {added} 家重点公司自动加入公告追踪")
+    return added
+
+
 def do_fetch_announcements():
     """执行一次公告抓取"""
     global _last_announcement_fetch_time
@@ -389,6 +420,7 @@ def do_fetch_announcements():
         return {"status": "skipped", "reason": "already running"}
 
     try:
+        _sync_focus_to_announcement_watchlist()
         watchlist = database.get_announcement_watchlist()
         rows, fetch_errors = announcements.fetch_for_watchlist(
             watchlist,
@@ -527,6 +559,249 @@ def api_delete_announcement_stock(code):
     return jsonify({"status": "ok"})
 
 
+# ==================== 公司信号 ====================
+
+def _signal_params() -> dict:
+    return {
+        "min_history": config.SIGNAL_MIN_HISTORY,
+        "lowvol_ratio": config.SIGNAL_LOWVOL_RATIO,
+        "consolidation_days": config.SIGNAL_CONSOLIDATION_DAYS,
+        "consolidation_max_range": config.SIGNAL_CONSOLIDATION_MAX_RANGE,
+        "consolidation_max_drift": config.SIGNAL_CONSOLIDATION_MAX_DRIFT,
+        "consolidation_vol_ratio": config.SIGNAL_CONSOLIDATION_VOL_RATIO,
+        "up_min_pct": config.SIGNAL_UP_MIN_PCT,
+        "up_vol_ratio": config.SIGNAL_UP_VOL_RATIO,
+        "bottom_range_days": config.SIGNAL_BOTTOM_RANGE_DAYS,
+        "bottom_near_low_pct": config.SIGNAL_BOTTOM_NEAR_LOW_PCT,
+        "bottom_off_high_pct": config.SIGNAL_BOTTOM_OFF_HIGH_PCT,
+        "bottom_max_drop": config.SIGNAL_BOTTOM_MAX_DROP,
+    }
+
+
+def do_scan_signals():
+    """批量抓日K线、检测量价形态；信号全部入库，只推送重点公司。"""
+    global _last_signal_scan_time
+    if not _signal_scan_lock.acquire(blocking=False):
+        print("⏳ 上一次信号扫描尚未完成，跳过")
+        return {"status": "skipped", "reason": "already running"}
+
+    try:
+        watchlist = database.get_company_watchlist()
+        if not watchlist:
+            return {"status": "ok", "message": "watchlist 为空，无需扫描",
+                    "new_signals": 0, "pushed": 0}
+
+        name_map = {c["code"]: c["name"] for c in watchlist}
+        focus_codes = {c["code"] for c in watchlist if c.get("is_focus")}
+        codes = [c["code"] for c in watchlist]
+
+        # 历史不足 SIGNAL_MIN_HISTORY 的先预热（近一年），其余只增量补最近
+        counts = database.get_kline_counts(codes)
+        warmup_codes = [c for c in codes if counts.get(c, 0) < config.SIGNAL_MIN_HISTORY]
+        incr_codes = [c for c in codes if counts.get(c, 0) >= config.SIGNAL_MIN_HISTORY]
+
+        fetch_errors = []
+        fetched = set()
+        if warmup_codes:
+            print(f"🔥 预热 {len(warmup_codes)} 家公司的历史K线...")
+            warm_klines, warm_errors = signals.fetch_daily_klines(warmup_codes, period_days=260)
+            fetch_errors.extend(warm_errors)
+            for code, klines in warm_klines.items():
+                database.upsert_klines(code, klines)
+                fetched.add(code)
+        if incr_codes:
+            incr_klines, incr_errors = signals.fetch_daily_klines(incr_codes, period_days=12)
+            fetch_errors.extend(incr_errors)
+            for code, klines in incr_klines.items():
+                database.upsert_klines(code, klines)
+                fetched.add(code)
+
+        if codes and not fetched:
+            return {
+                "status": "error",
+                "message": "所有公司日K线抓取失败，未执行信号检测",
+                "errors": fetch_errors,
+            }
+
+        params = _signal_params()
+        all_signals = []
+        skipped = []
+        for code in codes:
+            klines = database.get_klines(code, limit=150)
+            sigs, skip_reason = signals.detect_signals(code, klines, params)
+            if skip_reason:
+                skipped.append(f"{name_map.get(code, code)}: {skip_reason}")
+            all_signals.extend(sigs)
+
+        new_signals = database.save_signals(all_signals)
+        for s in new_signals:
+            s["name"] = name_map.get(s["code"], s["code"])
+
+        # 推送抑制窗口内重复形态；只推重点公司
+        to_push = []
+        for s in new_signals:
+            if s["code"] not in focus_codes:
+                continue
+            if database.has_recent_signal(
+                s["code"], s["signal_type"],
+                config.SIGNAL_REPEAT_SUPPRESS_DAYS, s["date"],
+            ):
+                continue
+            to_push.append(s)
+        if to_push:
+            notify_signals(to_push, {
+                "wechat_webhook_url":   config.WECHAT_WEBHOOK_URL,
+                "feishu_webhook_url":   config.FEISHU_WEBHOOK_URL,
+                "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
+            })
+
+        _last_signal_scan_time = datetime.now().isoformat()
+        result = {
+            "status": "ok",
+            "companies": len(codes),
+            "fetched": len(fetched),
+            "new_signals": len(new_signals),
+            "pushed": len(to_push),
+            "time": _last_signal_scan_time,
+        }
+        if fetch_errors:
+            result["errors"] = fetch_errors[:20]
+        if skipped:
+            result["skipped"] = skipped[:20]
+        return result
+    except Exception as e:
+        print(f"❌ 信号扫描失败: {e}")
+        import traceback; traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+    finally:
+        _signal_scan_lock.release()
+
+
+@app.route("/companies")
+def companies_page():
+    return render_template("companies.html")
+
+
+@app.route("/api/companies")
+def api_companies():
+    watchlist = database.get_company_watchlist()
+    latest = database.get_latest_klines()
+    for item in watchlist:
+        k = latest.get(item["code"]) or {}
+        item["last_close"] = k.get("close")
+        item["last_change_pct"] = k.get("change_pct")
+        item["last_date"] = k.get("date")
+    return jsonify({
+        "companies": watchlist,
+        "last_scan": _last_signal_scan_time,
+    })
+
+
+@app.route("/api/company-stocks", methods=["GET"])
+def api_company_stocks():
+    return jsonify({"stocks": database.get_company_watchlist()})
+
+
+@app.route("/api/company-stocks", methods=["POST"])
+def api_add_company_stock():
+    data = _get_json_payload()
+    if data is None:
+        return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
+    code = str(data.get("code", "")).strip().upper()
+    name = str(data.get("name", "")).strip()
+    market = str(data.get("market", "")).strip().upper()
+    if not code or not name or not market:
+        return jsonify({"status": "error", "message": "代码、名称、市场不能为空"}), 400
+    if not _ANNOUNCEMENT_CODE_RE.fullmatch(code):
+        return jsonify({"status": "error", "message": "代码格式应为 02400.HK 或 601919.SH"}), 400
+    if market not in {"A", "HK"}:
+        return jsonify({"status": "error", "message": "市场只能是 A 或 HK"}), 400
+    if (market == "HK") != code.endswith(".HK"):
+        return jsonify({"status": "error", "message": "市场与代码后缀不匹配"}), 400
+    ok = database.add_company_stock(code, name, market, bool(data.get("is_focus")))
+    if ok:
+        return jsonify({"status": "ok", "code": code, "name": name})
+    return jsonify({"status": "error", "message": "公司已存在或参数无效"}), 409
+
+
+@app.route("/api/company-stocks/import", methods=["POST"])
+def api_import_company_stocks():
+    data = _get_json_payload()
+    if data is None:
+        return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"status": "error", "message": "items 必须是非空数组"}), 400
+    added, skipped, invalid = 0, 0, []
+    for item in items:
+        if not isinstance(item, dict):
+            invalid.append(str(item))
+            continue
+        code = str(item.get("code", "")).strip().upper()
+        name = str(item.get("name", "")).strip()
+        market = str(item.get("market", "")).strip().upper()
+        if (not code or not name or market not in {"A", "HK"}
+                or not _ANNOUNCEMENT_CODE_RE.fullmatch(code)
+                or (market == "HK") != code.endswith(".HK")):
+            invalid.append(f"{code or name or item}")
+            continue
+        if database.add_company_stock(code, name, market, bool(item.get("is_focus"))):
+            added += 1
+        else:
+            skipped += 1
+    return jsonify({"status": "ok", "added": added, "skipped": skipped, "invalid": invalid})
+
+
+@app.route("/api/company-stocks/<path:code>", methods=["DELETE"])
+def api_delete_company_stock(code):
+    code = str(code or "").strip().upper()
+    if not _ANNOUNCEMENT_CODE_RE.fullmatch(code):
+        return jsonify({"status": "error", "message": "代码格式非法"}), 400
+    database.delete_company_stock(code)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/company-stocks/<path:code>/focus", methods=["PUT"])
+def api_set_company_focus(code):
+    code = str(code or "").strip().upper()
+    if not _ANNOUNCEMENT_CODE_RE.fullmatch(code):
+        return jsonify({"status": "error", "message": "代码格式非法"}), 400
+    data = _get_json_payload()
+    if data is None:
+        return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
+    if not database.set_company_focus(code, bool(data.get("is_focus"))):
+        return jsonify({"status": "error", "message": "公司不存在"}), 404
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/signals")
+def api_signals():
+    date = request.args.get("date", "").strip() or None
+    try:
+        limit = max(1, min(int(request.args.get("limit", 200)), 500))
+    except (ValueError, TypeError):
+        limit = 200
+    rows = database.get_signals(date, limit)
+    latest = database.get_latest_klines()
+    for row in rows:
+        k = latest.get(row["code"]) or {}
+        row["last_close"] = k.get("close")
+        row["last_change_pct"] = k.get("change_pct")
+        row["last_date"] = k.get("date")
+    return jsonify({
+        "signals": rows,
+        "dates": database.get_signal_dates(),
+        "labels": signals.SIGNAL_LABELS,
+        "last_scan": _last_signal_scan_time,
+    })
+
+
+@app.route("/api/signals/refresh", methods=["POST"])
+def api_signals_refresh():
+    result = do_scan_signals()
+    return jsonify(result)
+
+
 # ==================== 启动 ====================
 
 if __name__ == "__main__":
@@ -545,6 +820,11 @@ if __name__ == "__main__":
         start_announcement_scheduler(
             do_fetch_announcements,
             config.ANNOUNCEMENT_FETCH_INTERVAL_MINUTES,
+        )
+        start_signal_scheduler(
+            do_scan_signals,
+            hour=config.SIGNAL_REPORT_HOUR,
+            minute=config.SIGNAL_REPORT_MINUTE,
         )
     else:
         print("🔁 Reloader 子进程已启动")
