@@ -1,9 +1,19 @@
 # 雪球作者动态监控看板 — 配置文件
 
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# 抓取窗口、展示时间、调度器统一用北京时间，避免进程 TZ=UTC 时偏 8 小时
+TZ = ZoneInfo("Asia/Shanghai")
+
+
+def now() -> datetime:
+    return datetime.now(TZ)
 
 
 # 作者列表已移至数据库管理，请通过 Web UI（⚙️ 管理作者）添加初始作者

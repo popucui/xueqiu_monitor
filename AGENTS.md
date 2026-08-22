@@ -31,7 +31,7 @@ conda run -n xueqiu_monitor python app.py
 - 验证命令：
 
 ```bash
-conda run -n xueqiu_monitor python -m py_compile app.py database.py fetcher.py notifier.py price_fetcher.py scheduler.py announcements.py config.py
+conda run -n xueqiu_monitor python -m py_compile app.py database.py fetcher.py notifier.py price_fetcher.py scheduler.py announcements.py config.py signals.py
 conda run -n xueqiu_monitor flask --app app routes
 conda run -n xueqiu_monitor python -m unittest discover -v
 ```
@@ -61,7 +61,7 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - `price_fetcher.py`：yfinance 行情抓取。
 - `announcements.py`：巨潮/HKEXnews 公告抓取（org_id/stock_id 解析与回写）。
 - `scheduler.py`：APScheduler 共享 `BackgroundScheduler` 的四个任务。
-- `notifier.py`：Webhook 推送（分批、重试、业务错误码检查）。
+- `notifier.py`：Webhook 推送（分批、重试、业务错误码检查）。帖子与重点公司信号走 outbox。
 - `templates/index.html`、`templates/announcements.html`、
   `templates/companies.html`、`static/style.css`：深色看板 UI，纯 Jinja + 原生 JS。
 - `xueqiu_monitor.db`：本地 SQLite 数据库，git 忽略，**不得删除**。
@@ -92,8 +92,8 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 ### 行情
 
 - `price_fetcher.py` 经 yfinance 抓取，存 `commodity_prices`；首页"早盘行情"展示
-  各品种最新一条。API：`GET /api/prices`、`GET /api/prices/history`、
-  `POST /api/prices/refresh`。
+  各品种最新一条。全部品种失败时不入库、不推送 Webhook，保留原有行情。
+  API：`GET /api/prices`、`GET /api/prices/history`、`POST /api/prices/refresh`。
 
 ### 通知推送
 
@@ -104,6 +104,9 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - 新帖子按已配置渠道入 `post_notification_outbox`；成功批次删除，失败批次保留
   attempts 与错误、留待下次雪球抓取重试；attempts 达到 `NOTIFICATION_MAX_ATTEMPTS`
   （默认 20）后移出队列并打日志，不得改回无限重试。
+- 重点公司信号同样入 `signal_notification_outbox`，按 markdown 字节数分批，失败
+  留待下次扫描重试，上限与帖子相同。`notify_signals()` 默认只打控制台，真正推送
+  走 `_deliver_pending_signal_notifications()`。
 
 ### 公告追踪
 
@@ -142,7 +145,8 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - 数据源三级降级：Yahoo `yf.download` 分批 25 只 → 逐只 `history()` → 东财
   `push2his`（前复权）→ 腾讯 `ifzq.gtimg`（北交所只有腾讯有）。Yahoo 会按 IP
   限流（429），**不要假设 Yahoo 永远可用**；批量下载异常只在确有公司缺失时
-  才计入 errors。
+  才计入 errors。港股内部代码是 5 位（`02400.HK`），Yahoo 要去前导零后至少 4 位
+  （`2400.HK` / `0700.HK`），由 `to_yahoo_symbol()` 转换，勿把 5 位代码原样送给 Yahoo。
 - **成交量口径归一为"手"**：Yahoo A 股原始 volume 单位是股，东财/腾讯是手
   （1 手 = 100 股），跨源按 `(code, date)` 混存时口径不一致会让量比失真百倍。
   `_normalize_yahoo_volume` 在 Yahoo 数据入库前把 A 股 volume ÷100；港股三源
@@ -152,11 +156,12 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - 形态共四种：`high_vol_up` 放量上涨、`low_vol_bottom` 缩量下跌·底部
   （缩量阴跌 + 收盘价距 120 日低点 ≤10% + 距高点回撤 ≥20% + 单日跌幅 ≤5%，
   底部潜伏形态，detail 注明需人工核实基本面）、`consolidation` 横盘企稳、
-  `low_vol_down` 缩量下跌。页面与推送均按此优先级排序（`get_signals` 的
-  CASE 排序，勿改回按 code 排序）。
+  `low_vol_down` 缩量下跌。页面按「日期 → 重点公司优先 → 形态优先级 → 代码」
+  排序（`get_signals` 的 CASE，勿改回按 code 领先）；同日同公司多形态在
+  `/companies` 合成一张卡、多个徽标。推送仍按形态分组。
 - 推送策略：**只推 `is_focus=1` 的公司**；同一公司同一形态
-  `SIGNAL_REPEAT_SUPPRESS_DAYS` 天内不重复推（仍照常入库）。信号全部公司都
-  在 `/companies` 页面可见。
+  `SIGNAL_REPEAT_SUPPRESS_DAYS` 天内不重复推（仍照常入库）。符合条件的新信号
+  入 `signal_notification_outbox` 再投递。信号全部公司都在 `/companies` 页面可见。
 - 页面与 API：`GET /companies`、`GET /api/companies`、`GET|POST
   /api/company-stocks`、`POST /api/company-stocks/import`（批量导入）、
   `DELETE /api/company-stocks/<code>`、`PUT /api/company-stocks/<code>/focus`、
@@ -172,7 +177,7 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - `start_signal_scheduler(do_scan_signals, SIGNAL_REPORT_HOUR, SIGNAL_REPORT_MINUTE)`：
   工作日收盘后公司量价信号扫描（默认 16:40）。
 - `start_announcement_scheduler(do_fetch_announcements, ANNOUNCEMENT_FETCH_INTERVAL_MINUTES)`：
-  公告追踪。
+  公告追踪。首次运行默认延迟 5 分钟，避免与雪球 interval 任务同时抢 SQLite 写锁。
 
 `stop_scheduler()` 通过 `atexit` 注册，进程退出时优雅关闭。
 
@@ -197,6 +202,10 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - `WEB_HOST` / `WEB_PORT`：默认 `127.0.0.1:5001`。
 - `FLASK_DEBUG`：设为 `1`/`true`/`yes`/`on` 启用调试模式。
 
+抓取窗口、帖子/作者时间展示、`_last_*_time`、数据库 `*_at` 时间戳一律用
+`config.TZ`（`Asia/Shanghai`）的 aware datetime（`config.now()`），不要用
+进程本地的 naive `datetime.now()`。调度器时区已经是 Asia/Shanghai。
+
 ## 数据库约定
 
 `database.init_db()` 启动时建表并做轻量迁移。表：
@@ -206,10 +215,12 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
   `announcements`（主键 `(source, ann_id)`）、
   `post_notification_outbox`（主键 `(post_id, channel)`）、
   `company_watchlist`（主键 `code`）、`daily_klines`（主键 `(code, date)`）、
-  `daily_signals`（主键 `(code, date, signal_type)`）。
+  `daily_signals`（主键 `(code, date, signal_type)`）、
+  `signal_notification_outbox`（主键 `(code, date, signal_type, channel)`）。
 
 约定：
 
+- `get_conn()` 使用 `timeout=30` 与 `PRAGMA busy_timeout=30000`，并发写时等待而不是立即 `database is locked`。
 - 新增 schema 变更一律走 `init_db()` 或其助手函数里的**幂等迁移**逻辑。
 - `save_announcements()` 按 `(source, ann_id)` upsert；`first_seen_at` 只在首次
   插入写入，后续更新不得覆盖。
@@ -220,10 +231,13 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 ## UI 约定
 
 - 遵循 `static/style.css` 的现有深色看板风格，卡片保持紧凑（信息密度高）。
+- A 股与港股涨跌色是红涨绿跌（`.company-table` / `.signal-card` 的 `.price-change`）；
+  首页商品行情仍用绿涨红跌，不要混用。
 - 页面为 Jinja HTML + 原生 JavaScript，不引入框架或构建步骤。
-- 渲染外部数据一律走 `escapeHtml` / `textContent` / DOM API；外链 URL 使用协议
-  白名单校验（参照 `announcements.html` 的 `safeExternalUrl`），外链加
-  `rel="noopener noreferrer"`。
+- 渲染外部数据一律走 `escapeHtml` / `textContent` / DOM API；不要把 `escapeHtml`
+  的结果拼进 `onclick` / 属性字符串（它不编码引号）。交互按钮用 `addEventListener`。
+  外链 URL 使用协议白名单校验（`safeExternalUrl`，首页帖子走 `postTargetUrl`），
+  外链加 `rel="noopener noreferrer"`。
 
 ## 通用工作流程
 

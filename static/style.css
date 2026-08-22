@@ -811,6 +811,16 @@ body::before {
 .price-change.up   { color: var(--accent-green); }
 .price-change.down { color: var(--accent-rose); }
 
+/* A股/港股报价：红涨绿跌（与首页商品行情的西式配色区分） */
+.company-table .price-change.up,
+.signal-card .price-change.up {
+    color: var(--accent-rose);
+}
+.company-table .price-change.down,
+.signal-card .price-change.down {
+    color: var(--accent-green);
+}
+
 .btn-price-refresh {
     flex-shrink: 0;
     background: none;
@@ -999,6 +1009,13 @@ body::before {
     margin-bottom: 6px;
 }
 
+.signal-badges {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+}
+
 .signal-badge {
     display: inline-flex;
     border-radius: var(--radius-sm);
@@ -1033,6 +1050,23 @@ body::before {
     color: var(--text-secondary);
     font-size: 13px;
     line-height: 1.5;
+}
+
+.signal-detail-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.signal-detail-item {
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.signal-detail-label {
+    color: var(--text-muted);
+    margin-right: 6px;
 }
 
 .signal-badge.low_vol_bottom {

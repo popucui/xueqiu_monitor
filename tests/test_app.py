@@ -44,12 +44,14 @@ class RefreshStatusTests(unittest.TestCase):
 
     def test_all_prices_failed_returns_error(self):
         with patch.object(app, "fetch_prices", return_value={"_errors": ["all down"]}), \
-             patch.object(app.database, "save_prices"), \
-             patch.object(app, "notify_prices"):
+             patch.object(app.database, "save_prices") as save_prices, \
+             patch.object(app, "notify_prices") as notify_prices:
             result = app.do_fetch_prices()
 
         self.assertEqual("error", result["status"])
         self.assertEqual(["all down"], result["errors"])
+        save_prices.assert_not_called()
+        notify_prices.assert_not_called()
 
     def test_db_failure_does_not_restart_fetcher(self):
         class OkFetcher:
@@ -104,6 +106,12 @@ class AnnouncementStockApiTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.assertIsNone(captured["keywords"])
+
+
+class TimezoneTests(unittest.TestCase):
+    def test_now_uses_shanghai(self):
+        self.assertEqual("Asia/Shanghai", str(app.config.TZ))
+        self.assertEqual("Asia/Shanghai", str(app.config.now().tzinfo))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@
 """
 import sqlite3
 import os
-from datetime import datetime
 
 import config
 
@@ -15,8 +14,9 @@ def _get_db_path():
 
 
 def get_conn():
-    conn = sqlite3.connect(_get_db_path())
+    conn = sqlite3.connect(_get_db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -182,6 +182,19 @@ def init_db():
                 PRIMARY KEY (code, date, signal_type)
             );
             CREATE INDEX IF NOT EXISTS idx_signals_date ON daily_signals(date DESC);
+
+            CREATE TABLE IF NOT EXISTS signal_notification_outbox (
+                code        TEXT NOT NULL,
+                date        TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                channel     TEXT NOT NULL,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT DEFAULT '',
+                created_at  TEXT DEFAULT '',
+                PRIMARY KEY (code, date, signal_type, channel)
+            );
+            CREATE INDEX IF NOT EXISTS idx_signal_notification_outbox_channel
+                ON signal_notification_outbox(channel, created_at);
         """)
         _ensure_authors_sort_order(conn)
         _ensure_default_announcement_watchlist(conn)
@@ -205,7 +218,7 @@ def _ensure_default_announcement_watchlist(conn):
     if int(rows["total"] or 0) > 0:
         return
 
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     defaults = [
         (
             "02400.HK",
@@ -241,7 +254,7 @@ def save_posts(posts: list) -> list:
     if not posts:
         return []
     new_posts = []
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     with _ConnCtx() as conn:
         for p in posts:
             pid = str(p.get("id", ""))
@@ -286,7 +299,7 @@ def enqueue_post_notifications(posts: list, channels: list[str]) -> None:
     if not post_ids or not channel_names:
         return
 
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     rows = [
         (post_id, channel, now)
         for post_id in post_ids
@@ -365,6 +378,109 @@ def fail_post_notifications(channel: str, post_ids: list[str], error: str,
     return expired_ids
 
 
+def _signal_keys(signals: list) -> list[tuple[str, str, str]]:
+    keys = []
+    for signal in signals:
+        if isinstance(signal, (tuple, list)) and len(signal) >= 3:
+            code, date, signal_type = signal[0], signal[1], signal[2]
+        else:
+            code = str(signal.get("code") or "").strip().upper()
+            date = str(signal.get("date") or "").strip()
+            signal_type = str(signal.get("signal_type") or "").strip()
+        if code and date and signal_type:
+            keys.append((code, date, signal_type))
+    return keys
+
+
+def enqueue_signal_notifications(signals: list, channels: list[str]) -> None:
+    """将待推送的重点公司信号加入各渠道 outbox。"""
+    keys = _signal_keys(signals)
+    channel_names = sorted({str(channel).strip() for channel in channels if str(channel).strip()})
+    if not keys or not channel_names:
+        return
+
+    now = config.now().isoformat()
+    rows = [
+        (code, date, signal_type, channel, now)
+        for code, date, signal_type in keys
+        for channel in channel_names
+    ]
+    with _ConnCtx() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO signal_notification_outbox
+               (code, date, signal_type, channel, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+
+
+def get_pending_signal_notifications(channel: str, limit: int = 500) -> list:
+    """返回指定渠道尚未发送成功的信号（带公司名称）。"""
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            """SELECT s.*, w.name, w.is_focus,
+                      o.attempts,
+                      o.last_error AS notification_last_error
+               FROM signal_notification_outbox o
+               INNER JOIN daily_signals s
+                 ON s.code = o.code AND s.date = o.date AND s.signal_type = o.signal_type
+               LEFT JOIN company_watchlist w ON w.code = s.code
+               WHERE o.channel = ?
+               ORDER BY o.created_at ASC, s.date ASC, s.code ASC, s.signal_type ASC
+               LIMIT ?""",
+            (str(channel), max(1, int(limit))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def complete_signal_notifications(channel: str, signals: list) -> None:
+    """删除已成功发送的信号 outbox 项。"""
+    keys = _signal_keys(signals)
+    if not keys:
+        return
+    with _ConnCtx() as conn:
+        conn.executemany(
+            """DELETE FROM signal_notification_outbox
+               WHERE code = ? AND date = ? AND signal_type = ? AND channel = ?""",
+            [(code, date, signal_type, str(channel)) for code, date, signal_type in keys],
+        )
+        conn.commit()
+
+
+def fail_signal_notifications(channel: str, signals: list, error: str,
+                              max_attempts: int = None) -> list[tuple[str, str, str]]:
+    """记录信号发送失败；达到上限的项移出队列。"""
+    keys = _signal_keys(signals)
+    if not keys:
+        return []
+    with _ConnCtx() as conn:
+        conn.executemany(
+            """UPDATE signal_notification_outbox
+               SET attempts = attempts + 1, last_error = ?
+               WHERE code = ? AND date = ? AND signal_type = ? AND channel = ?""",
+            [(str(error)[:1000], code, date, signal_type, str(channel))
+             for code, date, signal_type in keys],
+        )
+        expired = []
+        if max_attempts is not None:
+            rows = conn.execute(
+                """SELECT code, date, signal_type FROM signal_notification_outbox
+                   WHERE channel = ? AND attempts >= ?""",
+                (str(channel), int(max_attempts)),
+            ).fetchall()
+            expired = [(row["code"], row["date"], row["signal_type"]) for row in rows]
+            if expired:
+                conn.executemany(
+                    """DELETE FROM signal_notification_outbox
+                       WHERE code = ? AND date = ? AND signal_type = ? AND channel = ?""",
+                    [(code, date, signal_type, str(channel))
+                     for code, date, signal_type in expired],
+                )
+        conn.commit()
+    return expired
+
+
 def get_recent_posts(limit: int = 50, author_id: str = None, offset: int = 0) -> list:
     with _ConnCtx() as conn:
         if author_id:
@@ -431,7 +547,7 @@ def add_author(user_id: str, name: str) -> bool:
     """添加作者，成功返回 True，已存在返回 False"""
     if not user_id or not name:
         return False
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     with _ConnCtx() as conn:
         order_row = conn.execute(
             "SELECT MIN(sort_order) AS min_order FROM authors"
@@ -605,7 +721,7 @@ def add_announcement_stock(
                 "主要经营数据", "经营简报", "月报",
             ]
     keywords_text = _keywords_to_text(keywords)
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     with _ConnCtx() as conn:
         order_row = conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM announcement_watchlist"
@@ -666,7 +782,7 @@ def save_announcements(announcements: list) -> list:
     if not announcements:
         return []
     new_rows = []
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     with _ConnCtx() as conn:
         for ann in announcements:
             source = ann.source
@@ -773,7 +889,7 @@ def add_company_stock(code: str, name: str, market: str, is_focus: bool = False)
     market = (market or "").strip().upper()
     if not code or not name or market not in {"A", "HK"}:
         return False
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     with _ConnCtx() as conn:
         order_row = conn.execute(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM company_watchlist"
@@ -825,7 +941,7 @@ def upsert_klines(code: str, klines: list) -> int:
     """
     if not code or not klines:
         return 0
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     written = 0
     with _ConnCtx() as conn:
         for k in klines:
@@ -843,8 +959,10 @@ def upsert_klines(code: str, klines: list) -> int:
                        close = excluded.close,
                        volume = excluded.volume,
                        fetched_at = excluded.fetched_at""",
-                (code.strip().upper(), date, k.get("open"), k.get("high"),
-                 k.get("low"), k.get("close"), k.get("volume"), now),
+                (code.strip().upper(), date,
+                 _round_price(k.get("open")), _round_price(k.get("high")),
+                 _round_price(k.get("low")), _round_price(k.get("close")),
+                 k.get("volume"), now),
             )
             written += 1
         conn.commit()
@@ -863,6 +981,19 @@ def get_klines(code: str, limit: int = 250) -> list:
     return [dict(row) for row in reversed(rows)]
 
 
+def _round_price(value, ndigits: int = 3):
+    """行情展示用：去掉 float32 残留（如 23.399999618530273 → 23.4）。"""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return round(number, ndigits)
+
+
 def get_latest_klines() -> dict:
     """返回 {code: 最新K线}，含 date/close/change_pct（相对前收盘）"""
     with _ConnCtx() as conn:
@@ -879,7 +1010,7 @@ def get_latest_klines() -> dict:
         ).fetchall()
     result = {}
     for row in rows:
-        close, prev_close = row["close"], row["prev_close"]
+        close, prev_close = _round_price(row["close"]), _round_price(row["prev_close"])
         change_pct = None
         if close and prev_close:
             change_pct = round((close - prev_close) / prev_close * 100, 2)
@@ -915,7 +1046,7 @@ def save_signals(signals: list) -> list:
     if not signals:
         return []
     new_rows = []
-    now = datetime.now().isoformat()
+    now = config.now().isoformat()
     with _ConnCtx() as conn:
         for s in signals:
             code = str(s.get("code") or "").strip().upper()
@@ -943,8 +1074,12 @@ def save_signals(signals: list) -> list:
 
 
 def get_signals(date: str = None, limit: int = 200) -> list:
-    """返回信号列表（带公司名称与重点标记），新日期在前；
-    同日按形态优先级排序：放量上涨 → 缩量下跌·底部 → 横盘企稳 → 缩量下跌"""
+    """返回信号列表（带公司名称与重点标记）。
+
+    排序：新日期在前 → 重点公司在前 → 形态优先级
+    （放量上涨 → 缩量下跌·底部 → 横盘企稳 → 缩量下跌）→ 代码。
+    同公司同日多形态会相邻，方便前端合成一张卡。
+    """
     order_case = ("CASE s.signal_type WHEN 'high_vol_up' THEN 0 "
                   "WHEN 'low_vol_bottom' THEN 1 "
                   "WHEN 'consolidation' THEN 2 ELSE 3 END")
@@ -955,7 +1090,7 @@ def get_signals(date: str = None, limit: int = 200) -> list:
                    FROM daily_signals s
                    LEFT JOIN company_watchlist w ON w.code = s.code
                    WHERE s.date = ?
-                   ORDER BY s.date DESC, {order_case}, w.is_focus DESC, s.code ASC
+                   ORDER BY s.date DESC, w.is_focus DESC, {order_case}, s.code ASC
                    LIMIT ?""",
                 (date, max(1, int(limit))),
             ).fetchall()
@@ -964,7 +1099,7 @@ def get_signals(date: str = None, limit: int = 200) -> list:
                 f"""SELECT s.*, w.name, w.is_focus
                    FROM daily_signals s
                    LEFT JOIN company_watchlist w ON w.code = s.code
-                   ORDER BY s.date DESC, {order_case}, w.is_focus DESC, s.code ASC
+                   ORDER BY s.date DESC, w.is_focus DESC, {order_case}, s.code ASC
                    LIMIT ?""",
                 (max(1, int(limit)),),
             ).fetchall()

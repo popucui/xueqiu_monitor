@@ -8,6 +8,8 @@ from datetime import datetime
 from urllib.parse import urlencode
 from playwright.sync_api import sync_playwright
 
+import config
+
 # 常见雪球表情映射
 EMOJI_MAP = {
     '[献花花]': '🌺', '[赞]': '👍', '[大笑]': '😄', '[微笑]': '🙂',
@@ -313,9 +315,9 @@ class XueqiuFetcher:
         all_posts = []
         errors = []
         if since_ms is not None:
-            since_text = datetime.fromtimestamp(since_ms / 1000).strftime("%Y-%m-%d %H:%M")
+            since_text = datetime.fromtimestamp(since_ms / 1000, tz=config.TZ).strftime("%Y-%m-%d %H:%M")
             print(f"  ⏱️ 抓取时间窗口: {since_text} 至今")
-        now_ms = int(datetime.now().timestamp() * 1000)
+        now_ms = int(config.now().timestamp() * 1000)
         stale_threshold_ms = 6 * 3600 * 1000
         for author in authors:
             uid = author["id"]
@@ -336,7 +338,7 @@ class XueqiuFetcher:
             if not posts and last_post_at:
                 last_ts = last_post_at.get(uid) or 0
                 if last_ts and (now_ms - last_ts) > stale_threshold_ms:
-                    last_text = datetime.fromtimestamp(last_ts / 1000).strftime("%Y-%m-%d %H:%M")
+                    last_text = datetime.fromtimestamp(last_ts / 1000, tz=config.TZ).strftime("%Y-%m-%d %H:%M")
                     print(f"     ⚠️ {name} 抓到 0 条，DB 最新一条停留在 {last_text}，可能静默失败")
             self._page.wait_for_timeout(1000)
         return all_posts, errors

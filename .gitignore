@@ -26,4 +26,5 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+.qoder/
 *.swp

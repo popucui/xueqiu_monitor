@@ -27,9 +27,14 @@ class ToYahooSymbolTests(unittest.TestCase):
     def test_sh_suffix_becomes_ss(self):
         self.assertEqual("601872.SS", signals.to_yahoo_symbol("601872.SH"))
 
-    def test_sz_hk_kept(self):
+    def test_sz_kept(self):
         self.assertEqual("000001.SZ", signals.to_yahoo_symbol("000001.SZ"))
+
+    def test_hk_yahoo_uses_four_digit_code(self):
+        self.assertEqual("2400.HK", signals.to_yahoo_symbol("02400.HK"))
+        self.assertEqual("0700.HK", signals.to_yahoo_symbol("00700.HK"))
         self.assertEqual("0152.HK", signals.to_yahoo_symbol("0152.HK"))
+        self.assertEqual("0001.HK", signals.to_yahoo_symbol("00001.HK"))
 
     def test_uppercase_and_strip(self):
         self.assertEqual("600519.SS", signals.to_yahoo_symbol(" 600519.sh "))
@@ -130,6 +135,14 @@ class CompanyDbTests(unittest.TestCase):
         self.db_path_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_sqlite_busy_timeout_is_30s(self):
+        conn = database.get_conn()
+        try:
+            row = conn.execute("PRAGMA busy_timeout").fetchone()
+            self.assertEqual(30000, int(row[0]))
+        finally:
+            conn.close()
+
     def test_add_duplicate_company_returns_false(self):
         self.assertTrue(database.add_company_stock("02400.HK", "心动公司", "HK"))
         self.assertFalse(database.add_company_stock("02400.HK", "心动公司", "HK"))
@@ -141,6 +154,16 @@ class CompanyDbTests(unittest.TestCase):
         rows = database.get_company_watchlist()
         self.assertEqual("601872.SH", rows[0]["code"])  # 重点在前
         self.assertEqual(1, rows[0]["is_focus"])
+
+    def test_latest_kline_price_rounded(self):
+        database.upsert_klines("002241.SZ", [{
+            "date": "2026-08-21", "open": 23.399999618530273,
+            "high": 23.5, "low": 23.3, "close": 23.399999618530273, "volume": 1,
+        }])
+        stored = database.get_klines("002241.SZ")[-1]["close"]
+        self.assertEqual(23.4, stored)
+        latest = database.get_latest_klines()["002241.SZ"]
+        self.assertEqual(23.4, latest["close"])
 
     def test_upsert_klines_idempotent(self):
         klines = _flat_klines(5)
@@ -157,6 +180,25 @@ class CompanyDbTests(unittest.TestCase):
                "detail": "x"}
         self.assertEqual(1, len(database.save_signals([sig])))
         self.assertEqual([], database.save_signals([sig]))
+
+    def test_get_signals_focus_before_type_priority(self):
+        database.add_company_stock("02400.HK", "心动公司", "HK", is_focus=True)
+        database.add_company_stock("601872.SH", "招商轮船", "A", is_focus=False)
+        database.save_signals([
+            {"code": "601872.SH", "date": "2026-08-21", "signal_type": "high_vol_up",
+             "detail": "非重点放量"},
+            {"code": "02400.HK", "date": "2026-08-21", "signal_type": "low_vol_down",
+             "detail": "重点缩量"},
+            {"code": "02400.HK", "date": "2026-08-21", "signal_type": "consolidation",
+             "detail": "重点横盘"},
+        ])
+        rows = database.get_signals("2026-08-21")
+        codes = [row["code"] for row in rows]
+        self.assertEqual(["02400.HK", "02400.HK", "601872.SH"], codes)
+        self.assertEqual(
+            ["consolidation", "low_vol_down"],
+            [row["signal_type"] for row in rows if row["code"] == "02400.HK"],
+        )
 
     def test_has_recent_signal_window(self):
         database.save_signals([
@@ -250,7 +292,7 @@ class FetchKlinesVolumeUnitTests(unittest.TestCase):
     def _multi_ticker_df(self):
         import pandas as pd
         fields = ["Open", "High", "Low", "Close", "Volume"]
-        tickers = ["601872.SS", "02400.HK"]
+        tickers = ["601872.SS", "2400.HK"]
         cols = pd.MultiIndex.from_product([fields, tickers])
         row = []
         for field in fields:
@@ -298,12 +340,14 @@ class SignalScanTests(unittest.TestCase):
                                          "market": "HK", "is_focus": 1}]), \
              patch.object(app_mod.database, "get_kline_counts", return_value={}), \
              patch.object(app_mod.signals, "fetch_daily_klines",
-                          return_value=({}, ["02400.HK: 无数据"])):
+                          return_value=({}, ["02400.HK: 无数据"])), \
+             patch.object(app_mod, "_deliver_pending_signal_notifications", return_value=[]):
             result = app_mod.do_scan_signals()
         self.assertEqual("error", result["status"])
 
     def test_empty_watchlist_ok(self):
-        with patch.object(app_mod.database, "get_company_watchlist", return_value=[]):
+        with patch.object(app_mod.database, "get_company_watchlist", return_value=[]), \
+             patch.object(app_mod, "_deliver_pending_signal_notifications", return_value=[]):
             result = app_mod.do_scan_signals()
         self.assertEqual("ok", result["status"])
 

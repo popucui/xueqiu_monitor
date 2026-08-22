@@ -6,9 +6,11 @@ import time
 import requests
 from datetime import datetime
 
+import config
+
 
 def fmt_ts(ts):
-    return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M") if ts else "?"
+    return datetime.fromtimestamp(ts / 1000, tz=config.TZ).strftime("%Y-%m-%d %H:%M") if ts else "?"
 
 
 def notify_new_posts(posts: list, config: dict = None):
@@ -67,22 +69,27 @@ _FEISHU_MD_LIMIT = 20000
 _DINGTALK_MD_LIMIT = 18000
 
 
+def _split_by_rendered_size(items, limit_bytes, render_fn):
+    """按渲染后的 markdown 字节数分批，保证单条消息不超平台上限。"""
+    batches = []
+    current = []
+    for item in items:
+        current.append(item)
+        if len(current) > 1 and len(render_fn(current).encode("utf-8")) > limit_bytes:
+            current.pop()
+            batches.append(current)
+            current = [item]
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _split_posts_by_size(posts, limit_bytes):
     """按渲染后的 markdown 字节数把帖子分批，保证单条消息不超平台上限。
 
     新作者首次抓取时 7 天帖子全算"新增"，单条消息很容易超限被平台拒收。
     """
-    batches = []
-    current = []
-    for p in posts:
-        current.append(p)
-        if len(current) > 1 and len(_build_markdown(current).encode("utf-8")) > limit_bytes:
-            current.pop()
-            batches.append(current)
-            current = [p]
-    if current:
-        batches.append(current)
-    return batches
+    return _split_by_rendered_size(posts, limit_bytes, _build_markdown)
 
 
 def _post_with_retry(url: str, payload: dict, name: str, max_retries: int = 3):
@@ -166,7 +173,7 @@ def _fmt_change(pct):
 
 
 def _build_price_markdown(prices: dict) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = config.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"## 🌅 早盘行情速报 · {now}\n"]
     from price_fetcher import _TICKERS
     order = list(_TICKERS.keys())
@@ -232,7 +239,7 @@ _SIGNAL_EMOJI = {
 
 def _build_signal_markdown(signals: list) -> str:
     from signals import SIGNAL_LABELS
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = config.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"## 📈 公司量价信号 · {now}（{len(signals)} 条，仅重点公司）\n"]
     by_type = {}
     for s in signals:
@@ -251,35 +258,75 @@ def _build_signal_markdown(signals: list) -> str:
 
 
 def notify_signals(signals: list, config: dict = None):
-    """推送公司信号到配置的 Webhook。调用方负责只传重点公司信号。"""
-    if not signals:
-        return
-    config = config or {}
-    md = _build_signal_markdown(signals)
+    """输出信号到控制台；若传入 webhook URL 则立即尝试推送（测试/兼容路径）。
 
+    生产路径走 ``deliver_signal_notifications`` + outbox，以便分批与失败重试。
+    """
+    if not signals:
+        return {}
+    cfg = config or {}
+    md = _build_signal_markdown(signals)
     print(md)
 
-    wechat_url   = config.get("wechat_webhook_url", "")
-    feishu_url   = config.get("feishu_webhook_url", "")
-    dingtalk_url = config.get("dingtalk_webhook_url", "")
-
+    results = {}
+    wechat_url = cfg.get("wechat_webhook_url", "")
+    feishu_url = cfg.get("feishu_webhook_url", "")
+    dingtalk_url = cfg.get("dingtalk_webhook_url", "")
     if wechat_url:
-        _post_with_retry(
-            wechat_url,
-            {"msgtype": "markdown", "markdown": {"content": md}},
-            "企业微信(信号)",
-        )
+        results["wechat"] = deliver_signal_notifications(signals, "wechat", wechat_url)
     if feishu_url:
-        _post_with_retry(feishu_url, {
+        results["feishu"] = deliver_signal_notifications(signals, "feishu", feishu_url)
+    if dingtalk_url:
+        results["dingtalk"] = deliver_signal_notifications(signals, "dingtalk", dingtalk_url)
+    return results
+
+
+def _signal_notification_payload(channel, batch):
+    md = _build_signal_markdown(batch)
+    if channel == "wechat":
+        return {"msgtype": "markdown", "markdown": {"content": md}}
+    if channel == "feishu":
+        return {
             "msg_type": "interactive",
             "card": {
-                "header": {"title": {"tag": "plain_text", "content": f"📈 公司量价信号 ({len(signals)} 条)"}},
+                "header": {"title": {"tag": "plain_text", "content": f"📈 公司量价信号 ({len(batch)} 条)"}},
                 "elements": [{"tag": "markdown", "content": md}],
             },
-        }, "飞书(信号)")
-    if dingtalk_url:
-        _post_with_retry(
-            dingtalk_url,
-            {"msgtype": "markdown", "markdown": {"title": "公司量价信号", "text": md}},
-            "钉钉(信号)",
+        }
+    if channel == "dingtalk":
+        return {"msgtype": "markdown", "markdown": {"title": "公司量价信号", "text": md}}
+    raise ValueError(f"不支持的通知渠道: {channel}")
+
+
+def deliver_signal_notifications(signals, channel: str, url: str) -> dict:
+    """发送一个渠道的信号通知，按批返回成功项与失败批次。"""
+    settings = {
+        "wechat": (_WECHAT_MD_LIMIT, "企业微信(信号)"),
+        "feishu": (_FEISHU_MD_LIMIT, "飞书(信号)"),
+        "dingtalk": (_DINGTALK_MD_LIMIT, "钉钉(信号)"),
+    }
+    if channel not in settings:
+        raise ValueError(f"不支持的通知渠道: {channel}")
+
+    limit_bytes, display_name = settings[channel]
+    result = {"sent": [], "failures": []}
+    for batch in _split_by_rendered_size(signals, limit_bytes, _build_signal_markdown):
+        items = [
+            {
+                "code": str(s.get("code") or "").strip().upper(),
+                "date": str(s.get("date") or "").strip(),
+                "signal_type": str(s.get("signal_type") or "").strip(),
+            }
+            for s in batch
+        ]
+        items = [item for item in items if item["code"] and item["date"] and item["signal_type"]]
+        error = _post_with_retry(
+            url,
+            _signal_notification_payload(channel, batch),
+            display_name,
         )
+        if error is None:
+            result["sent"].extend(items)
+        else:
+            result["failures"].append({"items": items, "error": error})
+    return result

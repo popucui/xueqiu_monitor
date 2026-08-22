@@ -2,7 +2,12 @@
 定时任务调度器
 """
 import atexit
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.background import BackgroundScheduler
+
+_SCHED_TZ = ZoneInfo("Asia/Shanghai")
 
 _scheduler = None
 
@@ -62,9 +67,15 @@ def start_signal_scheduler(scan_func, hour: int = 16, minute: int = 40):
     print(f"⏰ 公司信号扫描任务已启动，每个工作日 {hour:02d}:{minute:02d} CST 执行")
 
 
-def start_announcement_scheduler(fetch_func, interval_minutes: int = 60):
-    """启动公告追踪后台定时任务（间隔式）"""
+def start_announcement_scheduler(fetch_func, interval_minutes: int = 60,
+                                 start_delay_minutes: int = 5):
+    """启动公告追踪后台定时任务（间隔式）。
+
+    ``start_delay_minutes`` 把首次运行错开，避免与雪球 interval 任务
+    在同一时刻抢 SQLite 写锁。
+    """
     sched = _get_scheduler()
+    next_run = datetime.now(_SCHED_TZ) + timedelta(minutes=max(0, int(start_delay_minutes)))
     sched.add_job(
         fetch_func,
         "interval",
@@ -72,8 +83,12 @@ def start_announcement_scheduler(fetch_func, interval_minutes: int = 60):
         id="announcement_fetch",
         replace_existing=True,
         max_instances=1,
+        next_run_time=next_run,
     )
-    print(f"⏰ 公告追踪任务已启动，每 {interval_minutes} 分钟执行一次")
+    print(
+        f"⏰ 公告追踪任务已启动，每 {interval_minutes} 分钟执行一次"
+        f"（首次延迟 {start_delay_minutes} 分钟）"
+    )
 
 
 def stop_scheduler():

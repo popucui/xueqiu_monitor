@@ -99,11 +99,31 @@
             setTimeout(() => { toast.className = 'toast'; }, 2500);
         }
 
+        function fmtPrice(value) {
+            if (value == null || value === '') return '—';
+            const n = Number(value);
+            if (!Number.isFinite(n)) return '—';
+            const three = n.toFixed(3);
+            return three.endsWith('0') ? n.toFixed(2) : three;
+        }
+
         function fmtChange(pct) {
             if (pct == null) return '—';
             const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : '');
             const sign = pct > 0 ? '▲' : (pct < 0 ? '▼' : '');
             return `<span class="price-change ${cls}">${sign} ${Math.abs(pct).toFixed(2)}%</span>`;
+        }
+
+        function fmtChangeNode(pct) {
+            const span = document.createElement('span');
+            if (pct == null) {
+                span.textContent = '—';
+                return span;
+            }
+            span.className = 'price-change ' + (pct > 0 ? 'up' : (pct < 0 ? 'down' : ''));
+            const sign = pct > 0 ? '▲' : (pct < 0 ? '▼' : '');
+            span.textContent = `${sign} ${Math.abs(pct).toFixed(2)}%`;
+            return span;
         }
 
         async function loadAll() {
@@ -133,35 +153,60 @@
             document.getElementById('companyCount').textContent = companies.length;
             const container = document.getElementById('companyList');
             if (!companies.length) {
-                container.innerHTML = `
-                    <div class="empty-state">
-                        <div class="icon">🏢</div>
-                        <p>watchlist 为空，点击右上角「管理公司」添加。</p>
-                    </div>`;
+                const empty = document.createElement('div');
+                empty.className = 'empty-state';
+                const icon = document.createElement('div');
+                icon.className = 'icon';
+                icon.textContent = '🏢';
+                const hint = document.createElement('p');
+                hint.textContent = 'watchlist 为空，点击右上角「管理公司」添加。';
+                empty.append(icon, hint);
+                container.replaceChildren(empty);
                 return;
             }
-            container.innerHTML = `
-                <table class="company-table">
-                    <thead>
-                        <tr>
-                            <th></th><th>代码</th><th>名称</th><th>市场</th>
-                            <th>最新收盘</th><th>涨跌</th><th>K线日期</th><th></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${companies.map(item => `
-                            <tr class="${item.is_focus ? 'company-row-focus' : ''}">
-                                <td>${item.is_focus ? '⭐' : ''}</td>
-                                <td>${escapeHtml(item.code || '')}</td>
-                                <td>${escapeHtml(item.name || '')}</td>
-                                <td>${item.market === 'HK' ? '港股' : 'A股'}</td>
-                                <td>${item.last_close != null ? item.last_close : '—'}</td>
-                                <td>${fmtChange(item.last_change_pct)}</td>
-                                <td>${escapeHtml(item.last_date || '—')}</td>
-                                <td><button class="btn-delete-author" onclick="deleteCompany('${escapeHtml(item.code)}', '${escapeHtml(item.name)}')">删除</button></td>
-                            </tr>`).join('')}
-                    </tbody>
-                </table>`;
+
+            const table = document.createElement('table');
+            table.className = 'company-table';
+            const thead = document.createElement('thead');
+            const headRow = document.createElement('tr');
+            ['', '代码', '名称', '市场', '最新收盘', '涨跌', 'K线日期', ''].forEach(label => {
+                const th = document.createElement('th');
+                th.textContent = label;
+                headRow.appendChild(th);
+            });
+            thead.appendChild(headRow);
+
+            const tbody = document.createElement('tbody');
+            companies.forEach(item => {
+                const tr = document.createElement('tr');
+                if (item.is_focus) tr.className = 'company-row-focus';
+
+                const tdFocus = document.createElement('td');
+                tdFocus.textContent = item.is_focus ? '⭐' : '';
+                const tdCode = document.createElement('td');
+                tdCode.textContent = item.code || '';
+                const tdName = document.createElement('td');
+                tdName.textContent = item.name || '';
+                const tdMarket = document.createElement('td');
+                tdMarket.textContent = item.market === 'HK' ? '港股' : 'A股';
+                const tdClose = document.createElement('td');
+                tdClose.textContent = fmtPrice(item.last_close);
+                const tdChange = document.createElement('td');
+                tdChange.appendChild(fmtChangeNode(item.last_change_pct));
+                const tdDate = document.createElement('td');
+                tdDate.textContent = item.last_date || '—';
+                const tdDel = document.createElement('td');
+                const btn = document.createElement('button');
+                btn.className = 'btn-delete-author';
+                btn.textContent = '删除';
+                btn.addEventListener('click', () => deleteCompany(item.code, item.name));
+                tdDel.appendChild(btn);
+
+                tr.append(tdFocus, tdCode, tdName, tdMarket, tdClose, tdChange, tdDate, tdDel);
+                tbody.appendChild(tr);
+            });
+            table.append(thead, tbody);
+            container.replaceChildren(table);
         }
 
         function renderModalCompanies(companies) {
@@ -246,35 +291,143 @@
             return `https://xueqiu.com/S/${symbol}`;
         }
 
+        const SIGNAL_TYPE_ORDER = {
+            high_vol_up: 0,
+            low_vol_bottom: 1,
+            consolidation: 2,
+            low_vol_down: 3,
+        };
+
+        function groupSignals(rows) {
+            const groups = [];
+            const index = new Map();
+            for (const row of rows) {
+                const key = `${row.date || ''}\0${row.code || ''}`;
+                let group = index.get(key);
+                if (!group) {
+                    group = {
+                        date: row.date,
+                        code: row.code,
+                        name: row.name,
+                        is_focus: row.is_focus,
+                        last_close: row.last_close,
+                        last_change_pct: row.last_change_pct,
+                        last_date: row.last_date,
+                        items: [],
+                    };
+                    index.set(key, group);
+                    groups.push(group);
+                }
+                group.items.push({
+                    signal_type: row.signal_type,
+                    detail: row.detail,
+                });
+            }
+            for (const group of groups) {
+                group.items.sort((a, b) =>
+                    (SIGNAL_TYPE_ORDER[a.signal_type] ?? 9) - (SIGNAL_TYPE_ORDER[b.signal_type] ?? 9));
+            }
+            groups.sort((a, b) => {
+                if (a.date !== b.date) {
+                    return String(b.date || '').localeCompare(String(a.date || ''));
+                }
+                const focusA = a.is_focus ? 1 : 0;
+                const focusB = b.is_focus ? 1 : 0;
+                if (focusA !== focusB) return focusB - focusA;
+                const typeA = SIGNAL_TYPE_ORDER[a.items[0]?.signal_type] ?? 9;
+                const typeB = SIGNAL_TYPE_ORDER[b.items[0]?.signal_type] ?? 9;
+                if (typeA !== typeB) return typeA - typeB;
+                return String(a.code || '').localeCompare(String(b.code || ''));
+            });
+            return groups;
+        }
+
         function renderSignals(rows) {
             const container = document.getElementById('signalList');
             if (!rows.length) {
-                container.innerHTML = `
-                    <div class="empty-state">
-                        <div class="icon">📭</div>
-                        <p>暂无信号。添加公司后点击「扫描信号」获取数据。</p>
-                    </div>`;
+                const empty = document.createElement('div');
+                empty.className = 'empty-state';
+                const icon = document.createElement('div');
+                icon.className = 'icon';
+                icon.textContent = '📭';
+                const hint = document.createElement('p');
+                hint.textContent = '暂无信号。添加公司后点击「扫描信号」获取数据。';
+                empty.append(icon, hint);
+                container.replaceChildren(empty);
                 return;
             }
-            container.innerHTML = rows.map(row => {
-                const label = signalLabels[row.signal_type] || row.signal_type;
-                const xqUrl = xueqiuUrl(row.code);
-                const priceHtml = row.last_close != null
-                    ? `<span class="signal-price">${row.last_close} ${fmtChange(row.last_change_pct)}</span>`
-                    : '';
-                return `
-                    <article class="signal-card">
-                        <div class="signal-meta">
-                            <span class="signal-badge ${escapeHtml(row.signal_type)}">${escapeHtml(label)}</span>
-                            ${row.is_focus ? '<span class="signal-focus">⭐ 重点</span>' : ''}
-                            <span>${escapeHtml(row.name || '')} ${escapeHtml(row.code || '')}</span>
-                            ${priceHtml}
-                            <span>${escapeHtml(row.date || '')}</span>
-                            ${xqUrl ? `<a class="signal-xq-link" href="${escapeHtml(xqUrl)}" target="_blank" rel="noopener noreferrer">雪球 ↗</a>` : ''}
-                        </div>
-                        <div class="signal-detail">${escapeHtml(row.detail || '')}</div>
-                    </article>`;
-            }).join('');
+
+            const cards = groupSignals(rows).map(group => {
+                const article = document.createElement('article');
+                article.className = 'signal-card';
+
+                const meta = document.createElement('div');
+                meta.className = 'signal-meta';
+
+                const badges = document.createElement('span');
+                badges.className = 'signal-badges';
+                group.items.forEach(item => {
+                    const badge = document.createElement('span');
+                    const type = String(item.signal_type || '');
+                    badge.className = 'signal-badge' + (type ? ` ${type}` : '');
+                    badge.textContent = signalLabels[type] || type;
+                    badges.appendChild(badge);
+                });
+                meta.appendChild(badges);
+
+                if (group.is_focus) {
+                    const focus = document.createElement('span');
+                    focus.className = 'signal-focus';
+                    focus.textContent = '⭐ 重点';
+                    meta.appendChild(focus);
+                }
+
+                const name = document.createElement('span');
+                name.textContent = `${group.name || ''} ${group.code || ''}`.trim();
+                meta.appendChild(name);
+
+                if (group.last_close != null) {
+                    const price = document.createElement('span');
+                    price.className = 'signal-price';
+                    price.append(fmtPrice(group.last_close), ' ', fmtChangeNode(group.last_change_pct));
+                    meta.appendChild(price);
+                }
+
+                const date = document.createElement('span');
+                date.textContent = group.date || '';
+                meta.appendChild(date);
+
+                const xqUrl = xueqiuUrl(group.code);
+                if (xqUrl) {
+                    const link = document.createElement('a');
+                    link.className = 'signal-xq-link';
+                    link.href = xqUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.textContent = '雪球 ↗';
+                    meta.appendChild(link);
+                }
+                article.appendChild(meta);
+
+                const details = document.createElement('div');
+                details.className = group.items.length > 1 ? 'signal-detail-list' : 'signal-detail';
+                group.items.forEach(item => {
+                    const line = document.createElement('div');
+                    line.className = group.items.length > 1 ? 'signal-detail-item' : '';
+                    if (group.items.length > 1) {
+                        const label = document.createElement('span');
+                        label.className = 'signal-detail-label';
+                        label.textContent = (signalLabels[item.signal_type] || item.signal_type || '') + ' ·';
+                        line.append(label, document.createTextNode(' ' + (item.detail || '')));
+                    } else {
+                        line.textContent = item.detail || '';
+                    }
+                    details.appendChild(line);
+                });
+                article.appendChild(details);
+                return article;
+            });
+            container.replaceChildren(...cards);
         }
 
         async function scanSignals() {

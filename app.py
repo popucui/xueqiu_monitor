@@ -13,8 +13,8 @@ import announcements
 import database
 import signals
 from fetcher import XueqiuFetcher
-from notifier import (deliver_post_notifications, notify_new_posts, notify_prices,
-                      notify_signals)
+from notifier import (deliver_post_notifications, deliver_signal_notifications,
+                      notify_new_posts, notify_prices, notify_signals)
 from price_fetcher import fetch_prices
 from scheduler import (start_scheduler, start_price_scheduler,
                        start_announcement_scheduler, start_signal_scheduler)
@@ -81,6 +81,34 @@ def _deliver_pending_post_notifications() -> list[str]:
                 print(
                     f"⚠️ {channel} 通知重试 {config.NOTIFICATION_MAX_ATTEMPTS} 次仍失败，"
                     f"放弃 {len(expired_ids)} 条: {', '.join(expired_ids)}"
+                )
+    return errors
+
+
+def _deliver_pending_signal_notifications() -> list[str]:
+    """发送 outbox 中的信号通知，失败项保留到后续扫描重试。"""
+    errors = []
+    for channel, url in _webhook_channels().items():
+        if not url:
+            continue
+        pending = database.get_pending_signal_notifications(channel)
+        if not pending:
+            continue
+        delivery = deliver_signal_notifications(pending, channel, url)
+        database.complete_signal_notifications(channel, delivery["sent"])
+        for failure in delivery["failures"]:
+            expired = database.fail_signal_notifications(
+                channel,
+                failure["items"],
+                failure["error"],
+                max_attempts=config.NOTIFICATION_MAX_ATTEMPTS,
+            )
+            errors.append(f"{channel}: {failure['error']}")
+            if expired:
+                labels = [f"{code}/{date}/{stype}" for code, date, stype in expired]
+                print(
+                    f"⚠️ {channel} 信号通知重试 {config.NOTIFICATION_MAX_ATTEMPTS} 次仍失败，"
+                    f"放弃 {len(expired)} 条: {', '.join(labels)}"
                 )
     return errors
 
@@ -157,7 +185,7 @@ def do_fetch(wait_timeout: float = None):
             row["user_id"]: row.get("latest_at") or 0
             for row in database.get_authors_summary()
         }
-        since_dt = datetime.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
+        since_dt = config.now() - timedelta(days=config.POST_LOOKBACK_DAYS)
         since_ms = int(since_dt.timestamp() * 1000)
         try:
             fetcher = _get_fetcher()
@@ -195,7 +223,7 @@ def do_fetch(wait_timeout: float = None):
                 result["notification_errors"] = notification_errors
             return result
 
-        _last_fetch_time = datetime.now().isoformat()
+        _last_fetch_time = config.now().isoformat()
 
         result = {
             "status": "ok",
@@ -272,7 +300,7 @@ def api_posts():
     for p in posts:
         ts = p.get("created_at", 0)
         if ts:
-            p["created_at_fmt"] = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
+            p["created_at_fmt"] = datetime.fromtimestamp(ts / 1000, tz=config.TZ).strftime("%Y-%m-%d %H:%M")
         else:
             p["created_at_fmt"] = ""
     return jsonify({
@@ -290,7 +318,7 @@ def api_authors():
     for s in summary:
         ts = s.get("latest_at", 0)
         if ts:
-            s["latest_at_fmt"] = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
+            s["latest_at_fmt"] = datetime.fromtimestamp(ts / 1000, tz=config.TZ).strftime("%Y-%m-%d %H:%M")
         else:
             s["latest_at_fmt"] = ""
     db_authors = database.get_db_authors()
@@ -371,12 +399,6 @@ def do_fetch_prices():
         return {"status": "skipped", "reason": "already running"}
     try:
         prices = fetch_prices()
-        database.save_prices(prices)
-        notify_prices(prices, {
-            "wechat_webhook_url":   config.WECHAT_WEBHOOK_URL,
-            "feishu_webhook_url":   config.FEISHU_WEBHOOK_URL,
-            "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
-        })
         visible_prices = {k: v for k, v in prices.items() if not k.startswith("_")}
         fetch_errors = prices.get("_errors", [])
         if not visible_prices:
@@ -385,6 +407,12 @@ def do_fetch_prices():
                 "message": "所有行情数据获取失败，保留原有行情",
                 "errors": fetch_errors,
             }
+        database.save_prices(prices)
+        notify_prices(prices, {
+            "wechat_webhook_url":   config.WECHAT_WEBHOOK_URL,
+            "feishu_webhook_url":   config.FEISHU_WEBHOOK_URL,
+            "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
+        })
         result = {"status": "ok", "prices": visible_prices}
         if fetch_errors:
             result["errors"] = fetch_errors
@@ -434,7 +462,7 @@ def do_fetch_announcements():
                 "message": "所有关注公司公告抓取失败，未更新最近抓取时间",
                 "errors": fetch_errors,
             }
-        _last_announcement_fetch_time = datetime.now().isoformat()
+        _last_announcement_fetch_time = config.now().isoformat()
         result = {
             "status": "ok",
             "total_fetched": len(rows),
@@ -588,8 +616,12 @@ def do_scan_signals():
     try:
         watchlist = database.get_company_watchlist()
         if not watchlist:
-            return {"status": "ok", "message": "watchlist 为空，无需扫描",
-                    "new_signals": 0, "pushed": 0}
+            notification_errors = _deliver_pending_signal_notifications()
+            result = {"status": "ok", "message": "watchlist 为空，无需扫描",
+                      "new_signals": 0, "pushed": 0}
+            if notification_errors:
+                result["notification_errors"] = notification_errors
+            return result
 
         name_map = {c["code"]: c["name"] for c in watchlist}
         focus_codes = {c["code"] for c in watchlist if c.get("is_focus")}
@@ -617,11 +649,15 @@ def do_scan_signals():
                 fetched.add(code)
 
         if codes and not fetched:
-            return {
+            notification_errors = _deliver_pending_signal_notifications()
+            result = {
                 "status": "error",
                 "message": "所有公司日K线抓取失败，未执行信号检测",
                 "errors": fetch_errors,
             }
+            if notification_errors:
+                result["notification_errors"] = notification_errors
+            return result
 
         params = _signal_params()
         all_signals = []
@@ -649,13 +685,12 @@ def do_scan_signals():
                 continue
             to_push.append(s)
         if to_push:
-            notify_signals(to_push, {
-                "wechat_webhook_url":   config.WECHAT_WEBHOOK_URL,
-                "feishu_webhook_url":   config.FEISHU_WEBHOOK_URL,
-                "dingtalk_webhook_url": config.DINGTALK_WEBHOOK_URL,
-            })
+            channels = [channel for channel, url in _webhook_channels().items() if url]
+            database.enqueue_signal_notifications(to_push, channels)
+            notify_signals(to_push)
+        notification_errors = _deliver_pending_signal_notifications()
 
-        _last_signal_scan_time = datetime.now().isoformat()
+        _last_signal_scan_time = config.now().isoformat()
         result = {
             "status": "ok",
             "companies": len(codes),
@@ -668,6 +703,8 @@ def do_scan_signals():
             result["errors"] = fetch_errors[:20]
         if skipped:
             result["skipped"] = skipped[:20]
+        if notification_errors:
+            result["notification_errors"] = notification_errors
         return result
     except Exception as e:
         print(f"❌ 信号扫描失败: {e}")

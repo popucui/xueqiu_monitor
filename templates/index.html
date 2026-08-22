@@ -126,6 +126,23 @@
             return d.innerHTML;
         }
 
+        function safeExternalUrl(value) {
+            try {
+                const url = new URL(value || '');
+                return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+            } catch (_) {
+                return '';
+            }
+        }
+
+        function postTargetUrl(rawTarget) {
+            if (!rawTarget) return '';
+            if (rawTarget.startsWith('/')) {
+                return safeExternalUrl('https://xueqiu.com' + rawTarget);
+            }
+            return safeExternalUrl(rawTarget);
+        }
+
         // 获取作者姓名首字
         function getInitial(name) {
             return name ? name.charAt(0).toUpperCase() : '?';
@@ -184,11 +201,7 @@
                 const title = p.title || '';
                 const text = p.text || '';
                 const displayText = text && text !== title ? text : '';
-                // 只允许已知安全的相对路径和 https 链接，防止 javascript: 伪协议
-                const rawTarget = p.target || '';
-                const targetUrl = rawTarget.startsWith('http')
-                    ? rawTarget
-                    : (rawTarget.startsWith('/') ? `https://xueqiu.com${rawTarget}` : '');
+                const targetUrl = postTargetUrl(p.target || '');
                 const safeAuthor = escapeHtml(p.user_name || '未知');
                 const safeTime = escapeHtml(p.created_at_fmt || '');
 

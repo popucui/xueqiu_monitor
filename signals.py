@@ -48,10 +48,16 @@ DEFAULT_PARAMS = {
 
 
 def to_yahoo_symbol(code: str) -> str:
-    """内部代码（601872.SH / 000001.SZ / 0152.HK）→ Yahoo 格式"""
+    """内部代码（601872.SH / 000001.SZ / 02400.HK）→ Yahoo 格式。
+
+    港股内部是 5 位（02400.HK），Yahoo 用去前导零后至少 4 位（2400.HK / 0700.HK）。
+    """
     code = (code or "").strip().upper()
     if code.endswith(".SH"):
         return code[:-3] + ".SS"
+    if code.endswith(".HK"):
+        num = (code[:-3].lstrip("0") or "0").zfill(4)
+        return f"{num}.HK"
     return code
 
 
