@@ -1,12 +1,14 @@
 """
 雪球作者动态监控看板 — Flask Web 应用
 """
+import atexit
 import os
 import re
+import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, session, redirect
 
 import config
 import announcements
@@ -20,6 +22,9 @@ from scheduler import (start_scheduler, start_price_scheduler,
                        start_announcement_scheduler, start_signal_scheduler)
 
 app = Flask(__name__)
+# session 用于 WEB_API_TOKEN 的浏览器端登录态；未设 token 时随便给个随机
+# key（此时不启用鉴权，session 也不会被使用）
+app.secret_key = config.WEB_API_TOKEN or os.urandom(32)
 
 # 全局状态
 _last_fetch_time = None
@@ -37,6 +42,10 @@ _fetcher_lock = threading.Lock()
 # `greenlet.error: cannot switch to a different thread`。用单 worker 的
 # executor 把所有 fetcher 操作钉在同一线程上执行。
 _fetcher_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xq-fetcher")
+_XHR_HEADER = "X-Requested-With"
+_XHR_VALUE = "XMLHttpRequest"
+# WEB_API_TOKEN 登录态在 session 里的键
+_AUTH_SESSION_KEY = "web_auth"
 
 
 def _is_valid_user_id(user_id: str) -> bool:
@@ -48,6 +57,73 @@ def _get_json_payload():
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _require_xhr():
+    """simple request 不带自定义头，用来挡住跨站表单 POST。"""
+    if request.headers.get(_XHR_HEADER, "").strip() != _XHR_VALUE:
+        return jsonify({"status": "error", "message": "缺少 X-Requested-With 请求头"}), 403
+    return None
+
+
+def _provided_api_token() -> str:
+    provided = (request.headers.get("X-API-Token") or "").strip()
+    if not provided:
+        auth = request.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if not provided:
+        provided = (request.args.get("token") or "").strip()
+    return provided
+
+
+@app.before_request
+def _protect_requests():
+    # 静态资源与登录页本身不需要鉴权（未登录也要能加载样式）
+    if request.path.startswith("/static/") or request.path == "/auth":
+        return None
+    token = config.WEB_API_TOKEN
+    is_read = request.method in ("GET", "HEAD", "OPTIONS")
+    has_valid_token = bool(token) and _provided_api_token() == token
+    if not token:
+        # 未设 token：局域网可信模型，读放开，写仅受 WEB_READ_ONLY 约束
+        if not is_read and config.WEB_READ_ONLY:
+            return jsonify({"status": "error", "message": "当前为只读模式（WEB_READ_ONLY）"}), 403
+        return None
+    if is_read:
+        # 设置了 token 时读请求也要鉴权：页面里的 <meta name="api-token">
+        # 带有写令牌，若任何人都能读页面，令牌就泄露了，写保护形同虚设
+        if has_valid_token or session.get(_AUTH_SESSION_KEY):
+            return None
+        if request.path.startswith("/api/"):
+            return jsonify({"status": "error", "message": "未鉴权"}), 401
+        return render_template("auth.html", error=None), 401
+    # 写请求必须自带正确 token，session 登录态不算数——否则跨站表单可以
+    # 借浏览器里的登录态绕过 CSRF 防护（自定义头跨站请求带不出来）
+    if config.WEB_READ_ONLY:
+        return jsonify({"status": "error", "message": "当前为只读模式（WEB_READ_ONLY）"}), 403
+    if not has_valid_token:
+        return jsonify({"status": "error", "message": "缺少或错误的 X-API-Token"}), 403
+    return None
+
+
+@app.route("/auth", methods=["POST"])
+def auth_login():
+    payload = request.get_json(silent=True)
+    token = (request.form.get("token") or (payload or {}).get("token") or "").strip()
+    if not config.WEB_API_TOKEN or token != config.WEB_API_TOKEN:
+        if request.form:
+            return render_template("auth.html", error="令牌错误，请重试"), 401
+        return jsonify({"status": "error", "message": "令牌错误"}), 403
+    session[_AUTH_SESSION_KEY] = True
+    if request.form:
+        return redirect("/")
+    return jsonify({"status": "ok"})
+
+
+@app.context_processor
+def _template_globals():
+    return {"api_token": config.WEB_API_TOKEN}
 
 
 def _webhook_channels() -> dict[str, str]:
@@ -113,9 +189,9 @@ def _deliver_pending_signal_notifications() -> list[str]:
     return errors
 
 
-def _run_on_fetcher_thread(fn, *args, **kwargs):
+def _run_on_fetcher_thread(fn, *args, timeout=None, **kwargs):
     """把任意函数派发到固定的 fetcher worker 线程上同步执行。"""
-    return _fetcher_executor.submit(fn, *args, **kwargs).result()
+    return _fetcher_executor.submit(fn, *args, **kwargs).result(timeout=timeout)
 
 
 def _get_fetcher():
@@ -138,24 +214,44 @@ def _get_fetcher():
         return _fetcher_singleton
 
 
-def _stop_fetcher():
+def _stop_fetcher(*, shutdown: bool = False):
     global _fetcher_singleton, _fetcher_executor
     with _fetcher_lock:
+        had_fetcher = _fetcher_singleton is not None
         if _fetcher_singleton:
             try:
-                _run_on_fetcher_thread(_fetcher_singleton.stop)
+                _run_on_fetcher_thread(
+                    _fetcher_singleton.stop,
+                    timeout=10 if shutdown else None,
+                )
             except Exception:
                 import traceback
                 print("⚠️ 关闭浏览器失败（可能残留 Chromium 进程）:")
                 traceback.print_exc()
             _fetcher_singleton = None
+        if shutdown:
+            _fetcher_executor.shutdown(wait=False)
+            return
+        if not had_fetcher:
+            # 没有 browser 在跑，executor 线程从未沾过 Playwright 的
+            # asyncio event loop，不必重建（错误路径反复调用时避免堆积）
+            return
+        old_executor = _fetcher_executor
         # sync_playwright().start() 会在 executor 线程上创建 asyncio event loop；
         # stop() 未必能完全清理，导致同线程下次 start() 报
         # "using Playwright Sync API inside the asyncio loop"。重建 executor
         # 换一个干净线程即可恢复。
-        old_executor = _fetcher_executor
         _fetcher_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xq-fetcher")
         old_executor.shutdown(wait=False)
+
+
+def _shutdown_fetcher():
+    _stop_fetcher(shutdown=True)
+
+
+def _shutdown_on_signal(signum, frame):
+    _shutdown_fetcher()
+    raise SystemExit(0)
 
 
 def do_fetch(wait_timeout: float = None):
@@ -386,6 +482,9 @@ def api_update_author(user_id):
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
+    blocked = _require_xhr()
+    if blocked:
+        return blocked
     result = do_fetch(wait_timeout=120)
     return jsonify(result)
 
@@ -501,6 +600,9 @@ def api_prices_history():
 
 @app.route("/api/prices/refresh", methods=["POST"])
 def api_prices_refresh():
+    blocked = _require_xhr()
+    if blocked:
+        return blocked
     result = do_fetch_prices()
     return jsonify(result)
 
@@ -530,6 +632,9 @@ def api_announcements():
 
 @app.route("/api/announcements/refresh", methods=["POST"])
 def api_announcements_refresh():
+    blocked = _require_xhr()
+    if blocked:
+        return blocked
     result = do_fetch_announcements()
     return jsonify(result)
 
@@ -627,10 +732,23 @@ def do_scan_signals():
         focus_codes = {c["code"] for c in watchlist if c.get("is_focus")}
         codes = [c["code"] for c in watchlist]
 
-        # 历史不足 SIGNAL_MIN_HISTORY 的先预热（近一年），其余只增量补最近
+        # 历史不足 SIGNAL_MIN_HISTORY 的先预热（近一年）；已有足够历史但最早
+        # fetched_at 超过 SIGNAL_FULL_REFRESH_DAYS 也整段回拉，避免复权后假跳价
         counts = database.get_kline_counts(codes)
         warmup_codes = [c for c in codes if counts.get(c, 0) < config.SIGNAL_MIN_HISTORY]
         incr_codes = [c for c in codes if counts.get(c, 0) >= config.SIGNAL_MIN_HISTORY]
+        refresh_codes: list[str] = []
+        if incr_codes:
+            oldest = database.get_kline_oldest_fetched_at(incr_codes)
+            cutoff = (
+                config.now() - timedelta(days=config.SIGNAL_FULL_REFRESH_DAYS)
+            ).isoformat()
+            refresh_codes = [c for c in incr_codes if (oldest.get(c) or "") < cutoff]
+            if refresh_codes:
+                print(f"🔄 复权回补 {len(refresh_codes)} 家公司近一年 K 线...")
+                warmup_codes.extend(refresh_codes)
+                refresh_set = set(refresh_codes)
+                incr_codes = [c for c in incr_codes if c not in refresh_set]
 
         fetch_errors = []
         fetched = set()
@@ -641,6 +759,17 @@ def do_scan_signals():
             for code, klines in warm_klines.items():
                 database.upsert_klines(code, klines)
                 fetched.add(code)
+            # 复权回补失败的公司退化为 12 天增量：它们本来就有足够历史，
+            # 拿不到全量回拉时至少保持数据新鲜，避免当天信号检测整体跳过
+            retry_incr = [c for c in refresh_codes if c not in fetched]
+            if retry_incr:
+                print(f"⚠️ {len(retry_incr)} 家复权回补失败，退化为 12 天增量抓取")
+                fallback_klines, fallback_errors = signals.fetch_daily_klines(
+                    retry_incr, period_days=12)
+                fetch_errors.extend(fallback_errors)
+                for code, klines in fallback_klines.items():
+                    database.upsert_klines(code, klines)
+                    fetched.add(code)
         if incr_codes:
             incr_klines, incr_errors = signals.fetch_daily_klines(incr_codes, period_days=12)
             fetch_errors.extend(incr_errors)
@@ -835,6 +964,9 @@ def api_signals():
 
 @app.route("/api/signals/refresh", methods=["POST"])
 def api_signals_refresh():
+    blocked = _require_xhr()
+    if blocked:
+        return blocked
     result = do_scan_signals()
     return jsonify(result)
 
@@ -843,34 +975,39 @@ def api_signals_refresh():
 
 if __name__ == "__main__":
     database.init_db()
+    atexit.register(_shutdown_fetcher)
+    signal.signal(signal.SIGTERM, _shutdown_on_signal)
 
-    # 仅在主进程（非 reloader 子进程）中执行首次抓取和调度器
-    # WERKZEUG_RUN_MAIN 环境变量在 reloader 子进程中被设为 "true"
-    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    start_initial_fetch_background()
+    start_scheduler(lambda: do_fetch(wait_timeout=0), config.FETCH_INTERVAL_MINUTES)
+    start_price_scheduler(do_fetch_prices,
+                          hour=config.PRICE_REPORT_HOUR,
+                          minute=config.PRICE_REPORT_MINUTE)
+    start_announcement_scheduler(
+        do_fetch_announcements,
+        config.ANNOUNCEMENT_FETCH_INTERVAL_MINUTES,
+    )
+    start_signal_scheduler(
+        do_scan_signals,
+        hour=config.SIGNAL_REPORT_HOUR,
+        minute=config.SIGNAL_REPORT_MINUTE,
+    )
 
-    if not is_reloader_child:
-        start_initial_fetch_background()
-        start_scheduler(lambda: do_fetch(wait_timeout=0), config.FETCH_INTERVAL_MINUTES)
-        start_price_scheduler(do_fetch_prices,
-                              hour=config.PRICE_REPORT_HOUR,
-                              minute=config.PRICE_REPORT_MINUTE)
-        start_announcement_scheduler(
-            do_fetch_announcements,
-            config.ANNOUNCEMENT_FETCH_INTERVAL_MINUTES,
-        )
-        start_signal_scheduler(
-            do_scan_signals,
-            hour=config.SIGNAL_REPORT_HOUR,
-            minute=config.SIGNAL_REPORT_MINUTE,
-        )
-    else:
-        print("🔁 Reloader 子进程已启动")
-
-    # 启动 Web 服务；debug 需显式开启，避免误暴露调试器
     print(f"\n🌐 看板地址: http://{config.WEB_HOST}:{config.WEB_PORT}/")
+    if not config.is_loopback_bind():
+        print("⚠️ 正在监听非本机地址，写接口默认无登录，不要暴露到公网。")
+        if config.WEB_READ_ONLY:
+            print("   已开启 WEB_READ_ONLY，所有写操作会被拒绝。")
+        elif not config.WEB_API_TOKEN:
+            print("   未设置 WEB_API_TOKEN，局域网内任何人可以改 watchlist / 触发抓取。")
+        else:
+            print("   写操作需带 X-API-Token。")
+
+    # debug 只开调试器、不开 reloader，避免调度器活在父进程、HTTP 活在子进程
     app.run(
         host=config.WEB_HOST,
         port=config.WEB_PORT,
         debug=config.DEBUG,
-        reloader_type="stat" if config.DEBUG else "auto",
+        use_reloader=False,
+        threaded=True,
     )

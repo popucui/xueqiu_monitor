@@ -114,5 +114,94 @@ class TimezoneTests(unittest.TestCase):
         self.assertEqual("Asia/Shanghai", str(app.config.now().tzinfo))
 
 
+class WriteProtectionTests(unittest.TestCase):
+    _XHR = {"X-Requested-With": "XMLHttpRequest"}
+
+    def test_refresh_requires_xhr_header(self):
+        for path, target in (
+            ("/api/refresh", "do_fetch"),
+            ("/api/prices/refresh", "do_fetch_prices"),
+            ("/api/announcements/refresh", "do_fetch_announcements"),
+            ("/api/signals/refresh", "do_scan_signals"),
+        ):
+            with self.subTest(path=path), patch.object(app, target) as mocked:
+                response = app.app.test_client().post(path)
+            self.assertEqual(403, response.status_code)
+            mocked.assert_not_called()
+
+    def test_refresh_ok_with_xhr_header(self):
+        with patch.object(app, "do_fetch", return_value={"status": "ok"}):
+            response = app.app.test_client().post("/api/refresh", headers=self._XHR)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("ok", response.get_json()["status"])
+
+    def test_write_blocked_when_read_only(self):
+        with patch.object(app.config, "WEB_READ_ONLY", True):
+            response = app.app.test_client().post(
+                "/api/authors",
+                json={"user_id": "1", "name": "A"},
+            )
+        self.assertEqual(403, response.status_code)
+        self.assertIn("只读", response.get_json()["message"])
+
+    def test_write_requires_api_token(self):
+        payload = {"user_id": "1", "name": "A"}
+        with patch.object(app.config, "WEB_API_TOKEN", "secret"), \
+             patch.object(app.database, "add_author", return_value=True):
+            denied = app.app.test_client().post("/api/authors", json=payload)
+            allowed = app.app.test_client().post(
+                "/api/authors",
+                json=payload,
+                headers={"X-API-Token": "secret"},
+            )
+        self.assertEqual(403, denied.status_code)
+        self.assertEqual(200, allowed.status_code)
+
+    def test_api_read_requires_token(self):
+        with patch.object(app.config, "WEB_API_TOKEN", "secret"):
+            denied = app.app.test_client().get("/api/authors")
+            allowed = app.app.test_client().get(
+                "/api/authors", headers={"X-API-Token": "secret"}
+            )
+        self.assertEqual(401, denied.status_code)
+        self.assertEqual(200, allowed.status_code)
+
+    def test_page_shows_auth_prompt_without_token(self):
+        with patch.object(app.config, "WEB_API_TOKEN", "secret"):
+            response = app.app.test_client().get("/")
+        body = response.get_data(as_text=True)
+        self.assertEqual(401, response.status_code)
+        self.assertIn("WEB_API_TOKEN", body)
+        # 未鉴权页面绝不能泄露令牌本身
+        self.assertNotIn('content="secret"', body)
+
+    def test_auth_login_sets_session(self):
+        client = app.app.test_client()
+        with patch.object(app.config, "WEB_API_TOKEN", "secret"), \
+             patch.object(app.database, "get_authors_summary", return_value=[]), \
+             patch.object(app.database, "get_db_authors", return_value=[]), \
+             patch.object(app.database, "count_posts", return_value=0):
+            bad = client.post("/auth", data={"token": "wrong"})
+            self.assertEqual(401, bad.status_code)
+            ok = client.post("/auth", data={"token": "secret"})
+            self.assertEqual(302, ok.status_code)
+            response = client.get("/api/authors")
+        self.assertEqual(200, response.status_code)
+
+    def test_session_does_not_authorize_writes(self):
+        """session 登录态只能读；写请求必须带 X-API-Token，防跨站表单借登录态 CSRF。"""
+        client = app.app.test_client()
+        with patch.object(app.config, "WEB_API_TOKEN", "secret"), \
+             patch.object(app.database, "add_author", return_value=True):
+            client.post("/auth", data={"token": "secret"})
+            response = client.post("/api/authors", json={"user_id": "1", "name": "A"})
+        self.assertEqual(403, response.status_code)
+
+    def test_static_assets_not_gated(self):
+        with patch.object(app.config, "WEB_API_TOKEN", "secret"):
+            response = app.app.test_client().get("/static/api.js")
+        self.assertEqual(200, response.status_code)
+
+
 if __name__ == "__main__":
     unittest.main()

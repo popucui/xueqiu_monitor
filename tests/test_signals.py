@@ -1,17 +1,19 @@
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import app as app_mod
+import config
 import database
 import signals
 
 
 def _dates(n, end=None):
-    """返回最近 n 个自然日（含 end，默认今天）的 YYYY-MM-DD 升序列表"""
-    end = end or date.today()
+    """返回最近 n 个自然日（含 end，默认上海今天）的 YYYY-MM-DD 升序列表"""
+    end = end or config.now().date()
     return [(end - timedelta(days=n - 1 - i)).strftime("%Y-%m-%d") for i in range(n)]
 
 
@@ -61,12 +63,11 @@ class DetectSignalsTests(unittest.TestCase):
 
     def test_consolidation(self):
         # 前 40 日放量，近 20 日窄幅横盘且缩量
-        klines = _flat_klines(40, volume=2000.0)
-        flat = _flat_klines(20, volume=500.0,
-                            end=date.today())
+        today = config.now().date()
+        flat = _flat_klines(20, volume=500.0, end=today)
         # 拼接：前段截止昨天之前，避免日期重叠
         klines = _flat_klines(40, volume=2000.0,
-                              end=date.today() - timedelta(days=20))
+                              end=today - timedelta(days=20))
         klines.extend(flat)
         sigs, skip = signals.detect_signals("600001.SH", klines)
         self.assertIsNone(skip)
@@ -116,8 +117,16 @@ class DetectSignalsTests(unittest.TestCase):
         self.assertIn("历史不足", skip)
 
     def test_stale_kline_skipped(self):
-        klines = _flat_klines(60, end=date.today() - timedelta(days=10))
+        klines = _flat_klines(60, end=config.now().date() - timedelta(days=10))
         sigs, skip = signals.detect_signals("600001.SH", klines)
+        self.assertEqual([], sigs)
+        self.assertIn("停牌", skip)
+
+    def test_stale_uses_shanghai_calendar_not_process_today(self):
+        shanghai_now = datetime(2026, 9, 15, 7, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        klines = _flat_klines(60, end=date(2026, 9, 11))
+        with patch.object(signals.config, "now", return_value=shanghai_now):
+            sigs, skip = signals.detect_signals("600001.SH", klines)
         self.assertEqual([], sigs)
         self.assertIn("停牌", skip)
 
@@ -164,6 +173,13 @@ class CompanyDbTests(unittest.TestCase):
         self.assertEqual(23.4, stored)
         latest = database.get_latest_klines()["002241.SZ"]
         self.assertEqual(23.4, latest["close"])
+
+    def test_oldest_kline_fetched_at(self):
+        database.upsert_klines("02400.HK", _flat_klines(3, end=date(2026, 8, 7)))
+        oldest = database.get_kline_oldest_fetched_at(["02400.HK", "601872.SH"])
+        self.assertIn("02400.HK", oldest)
+        self.assertNotIn("601872.SH", oldest)
+        self.assertTrue(oldest["02400.HK"])
 
     def test_upsert_klines_idempotent(self):
         klines = _flat_klines(5)
@@ -349,6 +365,59 @@ class SignalScanTests(unittest.TestCase):
         with patch.object(app_mod.database, "get_company_watchlist", return_value=[]), \
              patch.object(app_mod, "_deliver_pending_signal_notifications", return_value=[]):
             result = app_mod.do_scan_signals()
+        self.assertEqual("ok", result["status"])
+
+    def _run_scan(self, fake_fetch, oldest_fetched_at):
+        """以 02400.HK（100 条历史）为 watchlist 跑一次 do_scan_signals。"""
+        with patch.object(app_mod.database, "get_company_watchlist",
+                          return_value=[{"code": "02400.HK", "name": "心动公司",
+                                         "market": "HK", "is_focus": 1}]), \
+             patch.object(app_mod.database, "get_kline_counts",
+                          return_value={"02400.HK": 100}), \
+             patch.object(app_mod.database, "get_kline_oldest_fetched_at",
+                          return_value={"02400.HK": oldest_fetched_at}), \
+             patch.object(app_mod.signals, "fetch_daily_klines", side_effect=fake_fetch), \
+             patch.object(app_mod, "_deliver_pending_signal_notifications", return_value=[]):
+            return app_mod.do_scan_signals()
+
+    def test_stale_adjusted_history_gets_full_refresh(self):
+        fetched = []
+
+        def fake_fetch(codes, period_days=12):
+            fetched.append((list(codes), period_days))
+            if period_days == 260:
+                return {"02400.HK": []}, []
+            return {}, ["02400.HK: 无数据"]
+
+        old = (config.now() - timedelta(days=8)).isoformat()
+        self._run_scan(fake_fetch, old)
+        self.assertEqual([(["02400.HK"], 260)], fetched)
+
+    def test_fresh_history_stays_incremental(self):
+        fetched = []
+
+        def fake_fetch(codes, period_days=12):
+            fetched.append((list(codes), period_days))
+            return {}, ["02400.HK: 无数据"]
+
+        self._run_scan(fake_fetch, config.now().isoformat())
+        self.assertEqual([(["02400.HK"], 12)], fetched)
+
+    def test_failed_full_refresh_falls_back_to_incremental(self):
+        fetched = []
+
+        def fake_fetch(codes, period_days=12):
+            fetched.append((list(codes), period_days))
+            if period_days == 260:
+                return {}, ["02400.HK: Yahoo 429"]
+            return {  # 12 天增量兜底成功
+                "02400.HK": [{"date": "2026-09-18", "open": 10, "high": 10.5,
+                              "low": 9.9, "close": 10.2, "volume": 1000}]
+            }, []
+
+        old = (config.now() - timedelta(days=8)).isoformat()
+        result = self._run_scan(fake_fetch, old)
+        self.assertEqual([(["02400.HK"], 260), (["02400.HK"], 12)], fetched)
         self.assertEqual("ok", result["status"])
 
 

@@ -1,5 +1,6 @@
 # Environment
 .env*
+!.env.example
 .venv/
 
 # Database
@@ -28,3 +29,6 @@ Thumbs.db
 .idea/
 .qoder/
 *.swp
+
+# Agent local settings
+.claude/

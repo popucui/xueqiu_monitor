@@ -71,10 +71,20 @@ SIGNAL_BOTTOM_OFF_HIGH_PCT = float(os.getenv("SIGNAL_BOTTOM_OFF_HIGH_PCT", "0.20
 SIGNAL_BOTTOM_MAX_DROP = float(os.getenv("SIGNAL_BOTTOM_MAX_DROP", "0.05"))
 # 同一公司同一形态 N 天内不重复推送（仍照常入库）
 SIGNAL_REPEAT_SUPPRESS_DAYS = int(os.getenv("SIGNAL_REPEAT_SUPPRESS_DAYS", "3"))
+# 已有足够历史的公司每隔 N 天整段回拉 K 线，避免拆股/分红后旧复权价假跳
+SIGNAL_FULL_REFRESH_DAYS = int(os.getenv("SIGNAL_FULL_REFRESH_DAYS", "7"))
 
 # ==================== Web 看板 ====================
-# 安全建议：默认仅监听本机，如需局域网访问可在 .env 中设置 WEB_HOST=0.0.0.0
+# 默认仅监听本机。WEB_HOST=0.0.0.0 时务必设 WEB_API_TOKEN（读写都鉴权，
+# 见 app.py 的 _protect_requests）或 WEB_READ_ONLY=1，且不要暴露到公网。
 WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.getenv("WEB_PORT", "5001"))
+WEB_API_TOKEN = os.getenv("WEB_API_TOKEN", "").strip()
+WEB_READ_ONLY = os.getenv("WEB_READ_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
 DEBUG = os.getenv("FLASK_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 DB_PATH = "xueqiu_monitor.db"
+
+
+def is_loopback_bind(host: str | None = None) -> bool:
+    h = (WEB_HOST if host is None else host).strip().lower()
+    return h in {"127.0.0.1", "localhost", "::1", "[::1]"}

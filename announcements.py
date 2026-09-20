@@ -59,14 +59,30 @@ POSITIVE_EXEMPTIONS = (
 )
 
 
+_NEGATIVE_KEYWORDS_LOWER = tuple(keyword.lower() for keyword in NEGATIVE_KEYWORDS)
+_POSITIVE_KEYWORDS_LOWER = tuple(keyword.lower() for keyword in POSITIVE_KEYWORDS)
+_POSITIVE_EXEMPTIONS_LOWER = tuple(keyword.lower() for keyword in POSITIVE_EXEMPTIONS)
+
+
 def classify_sentiment(title: str) -> str:
     """按标题关键词判定利好/利空：'positive' / 'negative' / ''（中性）。"""
     lower_title = (title or "").lower()
-    if any(keyword.lower() in lower_title for keyword in POSITIVE_EXEMPTIONS):
+    negative_hits = tuple(
+        keyword for keyword in _NEGATIVE_KEYWORDS_LOWER if keyword in lower_title
+    )
+
+    def _exemption_blocked(exemption: str) -> bool:
+        # "profit alert" 是 "negative profit alert" 的子串，不能当豁免
+        return any(exemption in neg for neg in negative_hits)
+
+    if any(
+        keyword in lower_title and not _exemption_blocked(keyword)
+        for keyword in _POSITIVE_EXEMPTIONS_LOWER
+    ):
         return "positive"
-    if any(keyword.lower() in lower_title for keyword in NEGATIVE_KEYWORDS):
+    if negative_hits:
         return "negative"
-    if any(keyword.lower() in lower_title for keyword in POSITIVE_KEYWORDS):
+    if any(keyword in lower_title for keyword in _POSITIVE_KEYWORDS_LOWER):
         return "positive"
     return ""
 

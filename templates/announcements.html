@@ -6,6 +6,7 @@
     <title>公告追踪</title>
     <meta name="description" content="关注股票公告追踪">
     <link rel="stylesheet" href="/static/style.css">
+    {% if api_token %}<meta name="api-token" content="{{ api_token }}">{% endif %}
 </head>
 <body>
     <nav class="navbar">
@@ -72,6 +73,7 @@
         </div>
     </div>
 
+    <script src="/static/api.js"></script>
     <script>
         let currentWatchlist = [];
 
@@ -207,7 +209,7 @@
             btn.disabled = true;
             btn.classList.add('loading');
             try {
-                const res = await fetch('/api/announcements/refresh', {method: 'POST'});
+                const res = await fetch('/api/announcements/refresh', {method: 'POST', headers: apiHeaders()});
                 const data = await res.json();
                 if (data.status === 'ok') {
                     const failed = (data.errors || []).length;
@@ -264,7 +266,7 @@
             }
             const res = await fetch('/api/announcement-stocks', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: apiHeaders({'Content-Type': 'application/json'}),
                 body: JSON.stringify(payload),
             });
             const data = await res.json();
@@ -281,7 +283,7 @@
 
         async function deleteStock(code, name) {
             if (!confirm(`确定删除「${name} ${code}」？历史公告会保留。`)) return;
-            const res = await fetch(`/api/announcement-stocks/${encodeURIComponent(code)}`, {method: 'DELETE'});
+            const res = await fetch(`/api/announcement-stocks/${encodeURIComponent(code)}`, {method: 'DELETE', headers: apiHeaders()});
             const data = await res.json();
             if (data.status === 'ok') {
                 showToast('✅ 已删除关注公司', 'success');

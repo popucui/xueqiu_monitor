@@ -1022,6 +1022,21 @@ def get_latest_klines() -> dict:
     return result
 
 
+def get_kline_oldest_fetched_at(codes: list) -> dict:
+    """返回 {code: 最早 fetched_at}，用于判断是否该整段回拉复权 K 线。"""
+    wanted = [(code or "").strip().upper() for code in codes if str(code).strip()]
+    if not wanted:
+        return {}
+    placeholders = ",".join("?" for _ in wanted)
+    with _ConnCtx() as conn:
+        rows = conn.execute(
+            f"SELECT code, MIN(fetched_at) AS oldest FROM daily_klines "
+            f"WHERE code IN ({placeholders}) GROUP BY code",
+            wanted,
+        ).fetchall()
+    return {row["code"]: row["oldest"] or "" for row in rows}
+
+
 def get_kline_counts(codes: list) -> dict:
     """返回 {code: 已存K线条数}，用于判断哪些公司需要预热"""
     wanted = [(code or "").strip().upper() for code in codes if str(code).strip()]

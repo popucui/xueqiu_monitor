@@ -5,10 +5,12 @@
 均前复权口径）。成交量统一为"手"口径：Yahoo A 股原始单位为股，入库前 ÷100。
 语义参照 price_fetcher：单只失败记入 errors 不阻塞整批。
 """
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 import requests
 import yfinance as yf
+
+import config
 
 # 批量下载分块大小：太大容易被 Yahoo 限流或单批拖垮
 _DOWNLOAD_BATCH = 25
@@ -279,7 +281,7 @@ def detect_signals(code: str, klines: list, params: dict = None) -> tuple:
         latest_date = datetime.strptime(latest["date"], "%Y-%m-%d").date()
     except (ValueError, TypeError, KeyError):
         return [], "最新K线日期异常"
-    if (date.today() - latest_date).days > p["stale_days"]:
+    if (config.now().date() - latest_date).days > p["stale_days"]:
         return [], f"最新K线停留在 {latest['date']}（停牌/节假日）"
 
     prev = klines[-2]

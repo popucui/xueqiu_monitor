@@ -1,0 +1,26 @@
+# Virtualenv / deps
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Git and editor
+.git/
+.claude/
+.qoder/
+.vscode/
+.idea/
+
+# Secrets and local state
+.env
+.env_bak
+*.db
+*.log
+tmp/
+
+# Binary / dump
+*.png
+*.csv
+*.json
+!package.json

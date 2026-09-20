@@ -18,34 +18,41 @@ Flask 本地监控看板，单一仓库、单进程应用，整合三类数据�
 
 ## 仓库边界与工作环境
 
-- 项目根目录：`/home/cuijie/workspace/web_dev/xueqiu_monitor`
-- Python 环境：conda 环境 `xueqiu_monitor`。不要假设或创建项目本地 `.venv`；
-  缺 Playwright 浏览器二进制时在该 conda 环境内显式安装。
+- 项目根目录：`/home/jiecui/workspace/web_dev/xueqiu_monitor`
+- Python 环境：项目根目录 `.venv`（系统 Python 3.12）。不要用 conda，也不要
+  假设存在项目外的 named env。缺 Playwright 浏览器二进制时在该 venv 内执行
+  `.venv/bin/playwright install chromium`（系统库用
+  `.venv/bin/playwright install-deps chromium`，需要 sudo）。
 - 启动命令（owner 实际使用）：
 
 ```bash
-cd /home/cuijie/workspace/web_dev/xueqiu_monitor
-conda run -n xueqiu_monitor python app.py
+cd /home/jiecui/workspace/web_dev/xueqiu_monitor
+source .venv/bin/activate
+python app.py
 ```
 
 - 验证命令：
 
 ```bash
-conda run -n xueqiu_monitor python -m py_compile app.py database.py fetcher.py notifier.py price_fetcher.py scheduler.py announcements.py config.py signals.py
-conda run -n xueqiu_monitor flask --app app routes
-conda run -n xueqiu_monitor python -m unittest discover -v
+cd /home/jiecui/workspace/web_dev/xueqiu_monitor
+.venv/bin/python -m py_compile app.py database.py fetcher.py notifier.py price_fetcher.py scheduler.py announcements.py config.py signals.py
+.venv/bin/flask --app app routes
+.venv/bin/python -m unittest discover -v
 ```
 
 - 需要临时 Web 服务做验证时，若线上 `WEB_PORT`（默认 5001）被占用，改用其他
   端口，验证完停掉临时进程：
 
 ```bash
-conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
+cd /home/jiecui/workspace/web_dev/xueqiu_monitor
+.venv/bin/flask --app app run --host 127.0.0.1 --port 5002
 ```
 
-- 后台定时任务与首次抓取只在 `app.py` 的 `if __name__ == "__main__"` 且非
-  Werkzeug reloader 子进程时启动；测试中 `import app` 或使用 `app.test_client()`
-  不会启动后台任务。
+- 后台定时任务与首次抓取只在 `app.py` 的 `if __name__ == "__main__"` 启动；
+  `app.run(..., use_reloader=False, threaded=True)`，debug 不开 reloader，
+  避免调度器与 HTTP 分属父子进程。测试中 `import app` 或使用
+  `app.test_client()` 不会启动后台任务。进程退出经 `atexit`/`SIGTERM` 关闭
+  Playwright；`./start.sh stop` 额外清理残留的 `ms-playwright` Chromium。
 - 开始工作前先检查工作区状态和相关源码，不覆盖、不回退用户已有改动。仓库可能
   已存在 `.codex`、`CODE_REVIEW.md` 等未跟踪文件，不要动。
 
@@ -140,8 +147,10 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
   `daily_klines`（`(code, date)` 主键，upsert）；信号存 `daily_signals`
   （`(code, date, signal_type)` 主键，天然去重）。
 - `do_scan_signals()` 用 `_signal_scan_lock` 非阻塞锁（仿 `do_fetch_prices`）：
-  K 线数 < `SIGNAL_MIN_HISTORY` 的公司预热近一年，其余只增量抓 12 自然日；
-  全部公司抓取失败返回 `status=error` 且不推进 `_last_signal_scan_time`。
+  K 线数 < `SIGNAL_MIN_HISTORY` 的公司预热近一年；已有足够历史但最早
+  `fetched_at` 超过 `SIGNAL_FULL_REFRESH_DAYS`（默认 7 天）也整段回拉，
+  避免拆股/分红后旧复权价假跳；其余只增量抓 12 自然日。全部公司抓取失败
+  返回 `status=error` 且不推进 `_last_signal_scan_time`。
 - 数据源三级降级：Yahoo `yf.download` 分批 25 只 → 逐只 `history()` → 东财
   `push2his`（前复权）→ 腾讯 `ifzq.gtimg`（北交所只有腾讯有）。Yahoo 会按 IP
   限流（429），**不要假设 Yahoo 永远可用**；批量下载异常只在确有公司缺失时
@@ -151,8 +160,8 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
   （1 手 = 100 股），跨源按 `(code, date)` 混存时口径不一致会让量比失真百倍。
   `_normalize_yahoo_volume` 在 Yahoo 数据入库前把 A 股 volume ÷100；港股三源
   均为股，保持不变。勿删此归一。
-- 检测前提：历史不足或最新 K 线距今 >3 自然日（停牌/节假日）跳过，防止拿旧
-  行情误报。
+- 检测前提：历史不足或最新 K 线距今（Asia/Shanghai 日历，勿用 `date.today()`）
+  >3 自然日（停牌/节假日）跳过，防止拿旧行情误报。
 - 形态共四种：`high_vol_up` 放量上涨、`low_vol_bottom` 缩量下跌·底部
   （缩量阴跌 + 收盘价距 120 日低点 ≤10% + 距高点回撤 ≥20% + 单日跌幅 ≤5%，
   底部潜伏形态，detail 注明需人工核实基本面）、`consolidation` 横盘企稳、
@@ -165,7 +174,10 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
 - 页面与 API：`GET /companies`、`GET /api/companies`、`GET|POST
   /api/company-stocks`、`POST /api/company-stocks/import`（批量导入）、
   `DELETE /api/company-stocks/<code>`、`PUT /api/company-stocks/<code>/focus`、
-  `GET /api/signals`、`POST /api/signals/refresh`。
+  `GET /api/signals`、`POST /api/signals/refresh`。四个手动刷新 POST
+  （`/api/refresh`、`/api/prices/refresh`、`/api/announcements/refresh`、
+  `/api/signals/refresh`）必须带 `X-Requested-With: XMLHttpRequest`，
+  防止跨站表单触发抓取。
 
 ### 后台任务
 
@@ -199,12 +211,22 @@ conda run -n xueqiu_monitor flask --app app run --host 127.0.0.1 --port 5002
   `SIGNAL_CONSOLIDATION_MAX_DRIFT`（0.05）、`SIGNAL_CONSOLIDATION_VOL_RATIO`
   （0.8）、`SIGNAL_UP_MIN_PCT`（0.03）、`SIGNAL_UP_VOL_RATIO`（2.0）、
   `SIGNAL_REPEAT_SUPPRESS_DAYS`（3）。
-- `WEB_HOST` / `WEB_PORT`：默认 `127.0.0.1:5001`。
-- `FLASK_DEBUG`：设为 `1`/`true`/`yes`/`on` 启用调试模式。
+- `WEB_HOST` / `WEB_PORT`：默认 `127.0.0.1:5001`。绑定 `0.0.0.0` 时
+  不要暴露到公网；应设 `WEB_API_TOKEN` 或 `WEB_READ_ONLY=1`。
+  设置 `WEB_API_TOKEN` 后**读写请求都要鉴权**（否则未鉴权页面里的
+  `<meta name="api-token">` 会把写令牌泄露给任何访客）：读的已鉴权途径为
+  `X-API-Token` 请求头 / `Authorization: Bearer` / `?token=` 参数，或
+  POST `/auth` 通过后在 session 里建立登录态（未鉴权页面返回 401 + 令牌
+  提示页，API 返回 401 JSON；`/static/` 与 `/auth` 不鉴权）。**写请求只认
+  请求头里的 token，session 不算数**——否则跨站表单可借登录态 CSRF；
+  `WEB_READ_ONLY=1` 时全部写请求 403。
+- `FLASK_DEBUG`：设为 `1`/`true`/`yes`/`on` 启用调试器（不开 reloader）。
+- `SIGNAL_FULL_REFRESH_DAYS`：已有历史的公司整段回拉间隔，默认 7。
 
-抓取窗口、帖子/作者时间展示、`_last_*_time`、数据库 `*_at` 时间戳一律用
-`config.TZ`（`Asia/Shanghai`）的 aware datetime（`config.now()`），不要用
-进程本地的 naive `datetime.now()`。调度器时区已经是 Asia/Shanghai。
+抓取窗口、帖子/作者时间展示、`_last_*_time`、数据库 `*_at` 时间戳、信号停牌
+判断一律用 `config.TZ`（`Asia/Shanghai`）的 aware datetime（`config.now()`），
+不要用进程本地的 naive `datetime.now()` / `date.today()`。调度器时区已经是
+Asia/Shanghai。
 
 ## 数据库约定
 

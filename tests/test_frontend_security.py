@@ -38,6 +38,13 @@ class FrontendSecurityTests(unittest.TestCase):
         self.assertIn("addEventListener('click'", function_body)
         self.assertIn("textContent", function_body)
 
+    def test_mutating_fetches_use_api_headers(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in ("index.html", "announcements.html", "companies.html"):
+            template = (root / "templates" / name).read_text(encoding="utf-8")
+            self.assertIn("apiHeaders", template)
+            self.assertIn("/static/api.js", template)
+
     def test_index_posts_use_safe_external_url(self):
         template = (
             Path(__file__).resolve().parents[1] / "templates" / "index.html"

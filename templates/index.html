@@ -6,6 +6,7 @@
     <title>雪球动态监控</title>
     <meta name="description" content="雪球作者动态监控看板 — 实时追踪关注作者的最新投资观点">
     <link rel="stylesheet" href="/static/style.css">
+    {% if api_token %}<meta name="api-token" content="{{ api_token }}">{% endif %}
 </head>
 <body>
 
@@ -102,6 +103,7 @@
         </div>
     </div>
 
+    <script src="/static/api.js"></script>
     <script>
         let allPosts = [];  // 当前筛选条件下已经懒加载出来的帖子
         let currentFilter = 'all';
@@ -352,7 +354,7 @@
             try {
                 const res = await fetch('/api/authors/order', {
                     method: 'PUT',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: apiHeaders({'Content-Type': 'application/json'}),
                     body: JSON.stringify({user_ids: dbAuthors.map(a => a.user_id)}),
                 });
                 const data = await res.json();
@@ -479,7 +481,7 @@
             overlay.classList.add('show');
 
             try {
-                const res = await fetch('/api/refresh', { method: 'POST' });
+                const res = await fetch('/api/refresh', { method: 'POST', headers: apiHeaders() });
                 const data = await res.json();
 
                 if (data.status === 'ok') {
@@ -570,7 +572,7 @@
             }
             const res = await fetch('/api/authors', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: apiHeaders({'Content-Type': 'application/json'}),
                 body: JSON.stringify({user_id: userId, name}),
             });
             const data = await res.json();
@@ -589,7 +591,7 @@
         }
 
         async function deleteAuthor(userId) {
-            const res = await fetch(`/api/authors/${userId}`, {method: 'DELETE'});
+            const res = await fetch(`/api/authors/${userId}`, {method: 'DELETE', headers: apiHeaders()});
             if (!res.ok) {
                 showToast('❌ 删除失败', 'error');
                 return;
@@ -672,7 +674,7 @@
             btn.disabled = true;
             btn.textContent = '…';
             try {
-                const res = await fetch('/api/prices/refresh', {method: 'POST'});
+                const res = await fetch('/api/prices/refresh', {method: 'POST', headers: apiHeaders()});
                 const data = await res.json();
                 if (data.status === 'ok') {
                     await loadPrices();

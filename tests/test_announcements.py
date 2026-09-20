@@ -132,6 +132,12 @@ class SentimentClassificationTests(unittest.TestCase):
         self.assertEqual("negative", announcements.classify_sentiment(
             "盈利警告 - Announcements and Notices - [Profit Warning / Inside Information]"))
 
+    def test_negative_profit_alert_not_exempted(self):
+        self.assertEqual("negative", announcements.classify_sentiment("Negative Profit Alert"))
+        self.assertEqual("negative", announcements.classify_sentiment("NEGATIVE PROFIT ALERT"))
+        self.assertEqual("negative", announcements.classify_sentiment(
+            "Negative Profit Alert - [Profit Warning / Inside Information]"))
+
 
 if __name__ == "__main__":
     unittest.main()

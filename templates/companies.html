@@ -6,6 +6,7 @@
     <title>公司信号</title>
     <meta name="description" content="公司 watchlist 与每日量价信号">
     <link rel="stylesheet" href="/static/style.css">
+    {% if api_token %}<meta name="api-token" content="{{ api_token }}">{% endif %}
 </head>
 <body>
     <nav class="navbar">
@@ -82,6 +83,7 @@
         </div>
     </div>
 
+    <script src="/static/api.js"></script>
     <script>
         let currentCompanies = [];
         let signalLabels = {};
@@ -435,7 +437,7 @@
             btn.disabled = true;
             btn.classList.add('loading');
             try {
-                const res = await fetch('/api/signals/refresh', {method: 'POST'});
+                const res = await fetch('/api/signals/refresh', {method: 'POST', headers: apiHeaders()});
                 const data = await res.json();
                 if (data.status === 'ok') {
                     const failed = (data.errors || []).length;
@@ -488,7 +490,7 @@
             }
             const res = await fetch('/api/company-stocks', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
+                headers: apiHeaders({'Content-Type': 'application/json'}),
                 body: JSON.stringify(payload),
             });
             const data = await res.json();
@@ -506,7 +508,7 @@
         async function toggleFocus(code, focus) {
             const res = await fetch(`/api/company-stocks/${encodeURIComponent(code)}/focus`, {
                 method: 'PUT',
-                headers: {'Content-Type': 'application/json'},
+                headers: apiHeaders({'Content-Type': 'application/json'}),
                 body: JSON.stringify({is_focus: focus}),
             });
             const data = await res.json();
@@ -520,7 +522,7 @@
 
         async function deleteCompany(code, name) {
             if (!confirm(`确定删除「${name} ${code}」？历史K线与信号会保留。`)) return;
-            const res = await fetch(`/api/company-stocks/${encodeURIComponent(code)}`, {method: 'DELETE'});
+            const res = await fetch(`/api/company-stocks/${encodeURIComponent(code)}`, {method: 'DELETE', headers: apiHeaders()});
             const data = await res.json();
             if (data.status === 'ok') {
                 showToast('✅ 已删除公司', 'success');
