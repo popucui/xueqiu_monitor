@@ -199,6 +199,7 @@ def init_db():
         _ensure_authors_sort_order(conn)
         _ensure_default_announcement_watchlist(conn)
         _ensure_announcements_sentiment(conn)
+        _ensure_capital_return_events_table(conn)
         conn.commit()
 
 
@@ -209,6 +210,28 @@ def _ensure_announcements_sentiment(conn):
     }
     if "sentiment" not in columns:
         conn.execute("ALTER TABLE announcements ADD COLUMN sentiment TEXT DEFAULT ''")
+
+
+def _ensure_capital_return_events_table(conn):
+    """幂等创建资本回报事件表；兼容 Flask CLI 导入时未走 init_db 的路径。"""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS capital_return_events (
+            event_id       TEXT PRIMARY KEY,
+            code           TEXT NOT NULL,
+            event_type     TEXT NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'executed',
+            amount         REAL,
+            market_cap     REAL,
+            currency       TEXT DEFAULT '',
+            shares         REAL,
+            event_date     TEXT NOT NULL DEFAULT '',
+            source         TEXT DEFAULT '',
+            source_url     TEXT DEFAULT '',
+            fetched_at     TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_capital_returns_code_date
+            ON capital_return_events(code, event_date DESC);
+    """)
 
 
 def _ensure_default_announcement_watchlist(conn):
@@ -930,7 +953,82 @@ def set_company_focus(code: str, is_focus: bool) -> bool:
             (1 if is_focus else 0, code),
         )
         conn.commit()
-        return cursor.rowcount > 0
+    return cursor.rowcount > 0
+
+
+def upsert_capital_return_events(events: list) -> int:
+    """写入结构化分红/回购事件，按 event_id 幂等更新。
+
+    ``dividend`` 的 amount 是每股现金分红；``buyback`` 的 amount 是回购金额，
+    market_cap 是该事件期间用于计算回购收益率的市值快照。这里只负责存储，
+    不把公告额度自动视为已执行事件。
+    """
+    if not events:
+        return 0
+    now = config.now().isoformat()
+    written = 0
+    with _ConnCtx() as conn:
+        _ensure_capital_return_events_table(conn)
+        for event in events:
+            event_id = str(event.get("event_id") or "").strip()
+            code = str(event.get("code") or "").strip().upper()
+            event_type = str(event.get("event_type") or "").strip().lower()
+            status = str(event.get("status") or "executed").strip().lower()
+            event_date = str(event.get("event_date") or "").strip()
+            if (not event_id or not code or event_type not in {"dividend", "buyback"}
+                    or status not in {"executed", "cancelled"} or not event_date):
+                continue
+            conn.execute(
+                """INSERT INTO capital_return_events
+                   (event_id, code, event_type, status, amount, market_cap,
+                    currency, shares, event_date, source, source_url, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_id) DO UPDATE SET
+                       code = excluded.code,
+                       event_type = excluded.event_type,
+                       status = excluded.status,
+                       amount = excluded.amount,
+                       market_cap = excluded.market_cap,
+                       currency = excluded.currency,
+                       shares = excluded.shares,
+                       event_date = excluded.event_date,
+                       source = excluded.source,
+                       source_url = excluded.source_url,
+                       fetched_at = excluded.fetched_at""",
+                (event_id, code, event_type, status,
+                 event.get("amount"), event.get("market_cap"),
+                 str(event.get("currency") or "").strip().upper(), event.get("shares"),
+                 event_date, str(event.get("source") or "").strip(),
+                 str(event.get("source_url") or "").strip(), event.get("fetched_at") or now),
+            )
+            written += 1
+        conn.commit()
+    return written
+
+
+def get_capital_return_events(codes: list, start_date: str = "", end_date: str = "") -> list:
+    """返回代码范围内的资本回报事件，供 TTM 计算使用。"""
+    wanted = [(code or "").strip().upper() for code in codes if str(code).strip()]
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    conditions = [f"code IN ({placeholders})"]
+    params = list(wanted)
+    if start_date:
+        conditions.append("event_date >= ?")
+        params.append(str(start_date))
+    if end_date:
+        conditions.append("event_date <= ?")
+        params.append(str(end_date))
+    with _ConnCtx() as conn:
+        _ensure_capital_return_events_table(conn)
+        rows = conn.execute(
+            "SELECT * FROM capital_return_events WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY code, event_date",
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def upsert_klines(code: str, klines: list) -> int:

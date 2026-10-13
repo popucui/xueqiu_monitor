@@ -66,6 +66,7 @@ cd /home/jiecui/workspace/web_dev/xueqiu_monitor
 - `signals.py`：公司量价信号——日 K 线三级数据源（Yahoo→东财→腾讯）与
   形态检测纯函数（缩量下跌、横盘企稳、放量上涨）。
 - `price_fetcher.py`：yfinance 行情抓取。
+- `dividend_metrics.py`：TTM 股息率、回购收益率与股东回报率计算（事件优先，演示数据兜底）。
 - `announcements.py`：巨潮/HKEXnews 公告抓取（org_id/stock_id 解析与回写）。
 - `scheduler.py`：APScheduler 共享 `BackgroundScheduler` 的四个任务。
 - `notifier.py`：Webhook 推送（分批、重试、业务错误码检查）。帖子与重点公司信号走 outbox。
@@ -237,6 +238,7 @@ Asia/Shanghai。
   `announcements`（主键 `(source, ann_id)`）、
   `post_notification_outbox`（主键 `(post_id, channel)`）、
   `company_watchlist`（主键 `code`）、`daily_klines`（主键 `(code, date)`）、
+  `capital_return_events`（主键 `event_id`，分红/回购结构化事件）、
   `daily_signals`（主键 `(code, date, signal_type)`）、
   `signal_notification_outbox`（主键 `(code, date, signal_type, channel)`）。
 

@@ -33,6 +33,8 @@
             <div>
                 <h1 class="posts-title">量价信号</h1>
                 <div class="announcements-subtitle">每个交易日收盘后自动检测：缩量下跌、横盘企稳、放量上涨。推送仅限重点公司。</div>
+                <div class="dividend-demo-note">股东回报为界面演示：TTM 股息率 = 现金分红 ÷ 最新价；回购收益率 = 已执行回购 ÷ 平均市值；股东回报率 = 两者合计。</div>
+                <a class="dividend-demo-jump" href="#companyListTitle">↓ 跳到 Watchlist 查看股息与回购回报</a>
             </div>
             <select id="signalDateFilter" class="announcement-filter" onchange="loadSignals()">
                 <option value="">最近信号</option>
@@ -45,7 +47,7 @@
             </div>
         </div>
 
-        <h1 class="posts-title company-list-title">Watchlist（<span id="companyCount">0</span> 家）</h1>
+        <h1 class="posts-title company-list-title" id="companyListTitle">Watchlist（<span id="companyCount">0</span> 家）</h1>
         <div id="companyList">
             <div class="empty-state">
                 <div class="icon">📡</div>
@@ -171,7 +173,7 @@
             table.className = 'company-table';
             const thead = document.createElement('thead');
             const headRow = document.createElement('tr');
-            ['', '代码', '名称', '市场', '最新收盘', '涨跌', 'K线日期', ''].forEach(label => {
+            ['', '代码', '名称', 'TTM股息率', 'TTM回购率', '股东回报率', '市场', '最新收盘', '涨跌', 'K线日期', ''].forEach(label => {
                 const th = document.createElement('th');
                 th.textContent = label;
                 headRow.appendChild(th);
@@ -195,6 +197,47 @@
                 tdClose.textContent = fmtPrice(item.last_close);
                 const tdChange = document.createElement('td');
                 tdChange.appendChild(fmtChangeNode(item.last_change_pct));
+                const tdDividend = document.createElement('td');
+                tdDividend.className = 'dividend-cell';
+                if (item.ttm_yield_pct != null) {
+                    const value = document.createElement('span');
+                    value.className = 'dividend-yield';
+                    value.textContent = `${Number(item.ttm_yield_pct).toFixed(2)}%`;
+                    value.title = `TTM：近365天示例分红 ${item.ttm_dividend} / 最新收盘 ${fmtPrice(item.last_close)}；截至 ${item.ttm_as_of}`;
+                    const tag = document.createElement('small');
+                    tag.className = 'dividend-demo-tag';
+                    tag.textContent = '演示';
+                    tdDividend.append(value, tag);
+                } else {
+                    tdDividend.textContent = '—';
+                    tdDividend.title = '暂无结构化分红事件数据';
+                }
+                const tdBuyback = document.createElement('td');
+                tdBuyback.className = 'dividend-cell';
+                if (item.ttm_buyback_yield_pct != null) {
+                    const value = document.createElement('span');
+                    value.className = 'buyback-yield';
+                    value.textContent = `${Number(item.ttm_buyback_yield_pct).toFixed(2)}%`;
+                    value.title = `TTM：近365天已执行回购 / 期间平均市值；截至 ${item.ttm_as_of}`;
+                    const tag = document.createElement('small');
+                    tag.className = 'dividend-demo-tag';
+                    tag.textContent = '演示';
+                    tdBuyback.append(value, tag);
+                } else {
+                    tdBuyback.textContent = '—';
+                    tdBuyback.title = '暂无已执行回购事件数据';
+                }
+                const tdShareholder = document.createElement('td');
+                tdShareholder.className = 'dividend-cell';
+                if (item.shareholder_yield_pct != null) {
+                    const value = document.createElement('span');
+                    value.className = 'shareholder-yield';
+                    value.textContent = `${Number(item.shareholder_yield_pct).toFixed(2)}%`;
+                    value.title = '股东回报率 = TTM 股息率 + TTM 回购收益率';
+                    tdShareholder.appendChild(value);
+                } else {
+                    tdShareholder.textContent = '—';
+                }
                 const tdDate = document.createElement('td');
                 tdDate.textContent = item.last_date || '—';
                 const tdDel = document.createElement('td');
@@ -204,7 +247,7 @@
                 btn.addEventListener('click', () => deleteCompany(item.code, item.name));
                 tdDel.appendChild(btn);
 
-                tr.append(tdFocus, tdCode, tdName, tdMarket, tdClose, tdChange, tdDate, tdDel);
+                tr.append(tdFocus, tdCode, tdName, tdDividend, tdBuyback, tdShareholder, tdMarket, tdClose, tdChange, tdDate, tdDel);
                 tbody.appendChild(tr);
             });
             table.append(thead, tbody);

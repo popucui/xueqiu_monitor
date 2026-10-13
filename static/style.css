@@ -849,6 +849,54 @@ body::before {
     margin-top: 4px;
 }
 
+.dividend-demo-note {
+    margin-top: 5px;
+    color: var(--accent-gold);
+    font-size: 11px;
+}
+
+.dividend-demo-jump {
+    display: inline-block;
+    margin-top: 5px;
+    color: var(--accent-cyan);
+    font-size: 12px;
+    text-decoration: none;
+}
+
+.dividend-demo-jump:hover {
+    text-decoration: underline;
+}
+
+.dividend-cell {
+    white-space: nowrap;
+}
+
+.dividend-yield {
+    color: var(--accent-gold);
+    font-weight: 600;
+}
+
+.buyback-yield {
+    color: var(--accent-cyan);
+    font-weight: 600;
+}
+
+.shareholder-yield {
+    color: var(--accent-green);
+    font-weight: 700;
+}
+
+.dividend-demo-tag {
+    display: inline-block;
+    margin-left: 5px;
+    padding: 1px 4px;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 4px;
+    color: var(--accent-gold);
+    font-size: 10px;
+    font-weight: 400;
+}
+
 .announcement-filter {
     min-width: 180px;
     border: 1px solid var(--border);

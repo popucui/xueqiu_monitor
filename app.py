@@ -13,6 +13,7 @@ from flask import Flask, render_template, jsonify, request, session, redirect
 import config
 import announcements
 import database
+import dividend_metrics
 import signals
 from fetcher import XueqiuFetcher
 from notifier import (deliver_post_notifications, deliver_signal_notifications,
@@ -852,20 +853,102 @@ def companies_page():
 def api_companies():
     watchlist = database.get_company_watchlist()
     latest = database.get_latest_klines()
+    as_of = config.now().date()
+    start_date = (as_of - timedelta(days=365)).isoformat()
+    events = database.get_capital_return_events(
+        [item["code"] for item in watchlist],
+        start_date=start_date,
+        end_date=as_of.isoformat(),
+    )
+    dividend_by_code = dividend_metrics.get_ttm_metrics(
+        watchlist, latest, events, as_of=as_of.isoformat(),
+    )
     for item in watchlist:
         k = latest.get(item["code"]) or {}
         item["last_close"] = k.get("close")
         item["last_change_pct"] = k.get("change_pct")
         item["last_date"] = k.get("date")
+        item.update(dividend_by_code.get(item["code"], {
+            "ttm_dividend": None,
+            "ttm_yield_pct": None,
+            "ttm_buyback_yield_pct": None,
+            "shareholder_yield_pct": None,
+            "ttm_as_of": None,
+            "ttm_status": "no_data",
+            "ttm_source": "暂无资本回报事件",
+            "ttm_window_days": 365,
+        }))
     return jsonify({
         "companies": watchlist,
         "last_scan": _last_signal_scan_time,
+        "dividend_demo": True,
     })
 
 
 @app.route("/api/company-stocks", methods=["GET"])
 def api_company_stocks():
     return jsonify({"stocks": database.get_company_watchlist()})
+
+
+@app.route("/api/capital-return-events/import", methods=["POST"])
+def api_import_capital_return_events():
+    """导入已核实的分红/回购事件，供 TTM 计算使用。"""
+    blocked = _require_xhr()
+    if blocked:
+        return blocked
+    data = _get_json_payload()
+    if data is None:
+        return jsonify({"status": "error", "message": "请求体必须是 JSON 对象"}), 400
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"status": "error", "message": "items 必须是非空数组"}), 400
+
+    valid = []
+    invalid = []
+    for item in items[:500]:
+        if not isinstance(item, dict):
+            invalid.append(str(item))
+            continue
+        event_id = str(item.get("event_id") or "").strip()
+        code = str(item.get("code") or "").strip().upper()
+        event_type = str(item.get("event_type") or "").strip().lower()
+        status = str(item.get("status") or "executed").strip().lower()
+        event_date = str(item.get("event_date") or "").strip()
+        try:
+            amount = float(item.get("amount"))
+            market_cap = float(item.get("market_cap")) if item.get("market_cap") is not None else None
+        except (TypeError, ValueError):
+            amount, market_cap = -1, None
+        valid_code = bool(_ANNOUNCEMENT_CODE_RE.fullmatch(code))
+        valid_date = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date))
+        valid_event = (
+            bool(event_id) and valid_code and event_type in {"dividend", "buyback"}
+            and status in {"executed", "cancelled"} and valid_date and amount >= 0
+            and (event_type != "buyback" or (market_cap is not None and market_cap > 0))
+        )
+        if not valid_event:
+            invalid.append(event_id or code or str(item))
+            continue
+        valid.append({
+            "event_id": event_id,
+            "code": code,
+            "event_type": event_type,
+            "status": status,
+            "amount": amount,
+            "market_cap": market_cap,
+            "currency": str(item.get("currency") or "").strip().upper(),
+            "shares": item.get("shares"),
+            "event_date": event_date,
+            "source": str(item.get("source") or "manual").strip(),
+            "source_url": str(item.get("source_url") or "").strip(),
+        })
+    written = database.upsert_capital_return_events(valid)
+    return jsonify({
+        "status": "ok",
+        "written": written,
+        "invalid": invalid,
+        "truncated": max(0, len(items) - 500),
+    })
 
 
 @app.route("/api/company-stocks", methods=["POST"])
