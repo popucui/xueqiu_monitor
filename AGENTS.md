@@ -90,6 +90,10 @@ cd /home/jiecui/workspace/web_dev/xueqiu_monitor
     防 Chromium 进程泄漏。
 - 页内每次雪球 API 请求带 30 秒 `AbortSignal` 超时
   （`XueqiuFetcher._API_TIMEOUT_MS`），防止挂死请求永久持有抓取锁。
+- 抓取途中收到含 `EO_Bot_Ssid` 的 WAF 脚本时，在同一浏览器内导航到该 API
+  地址完成验证，再重试原请求一次；导航同样限时 30 秒，持续失败必须报告。
+  后续分页抛错时通过 `FetchUserPostsError.posts` 保留此前成功的页，批量层同时
+  返回帖子和作者错误，不能因分页失败丢弃该作者的已抓数据。
 - `fetch_all_authors()` 返回 `(posts, errors)`：单个作者失败记入 errors 并继续，
   已抓到的帖子永远照常落库；全部失败时 `do_fetch()` 返回 `status=error` 且不推进
   `_last_fetch_time`，避免把旧数据呈现为刚检查过。

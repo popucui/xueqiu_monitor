@@ -42,6 +42,30 @@ class RefreshStatusTests(unittest.TestCase):
         self.assertEqual("error", result["status"])
         self.assertEqual("previous-success", app._last_announcement_fetch_time)
 
+    def test_partial_author_failure_saves_posts_without_restarting_browser(self):
+        posts = [{"id": "saved-page-one"}]
+
+        class PartialFetcher:
+            def fetch_all_authors(self, *args, **kwargs):
+                return posts, [{"user_id": "1", "name": "A", "error": "page=2 WAF"}]
+
+        with patch.object(app, "_get_fetcher", return_value=PartialFetcher()), \
+             patch.object(app, "_run_on_fetcher_thread", side_effect=lambda fn, *a, **kw: fn(*a, **kw)), \
+             patch.object(app.database, "get_db_authors", return_value=[
+                 {"user_id": "1", "name": "A"}, {"user_id": "2", "name": "B"},
+             ]), \
+             patch.object(app.database, "get_authors_summary", return_value=[]), \
+             patch.object(app.database, "save_posts", return_value=[]) as save_posts, \
+             patch.object(app, "_deliver_pending_post_notifications", return_value=[]), \
+             patch.object(app, "_stop_fetcher") as stop_fetcher:
+            result = app.do_fetch(wait_timeout=0)
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(1, result["total_fetched"])
+        self.assertIn("page=2 WAF", result["errors"][0])
+        save_posts.assert_called_once_with(posts)
+        stop_fetcher.assert_not_called()
+
     def test_all_prices_failed_returns_error(self):
         with patch.object(app, "fetch_prices", return_value={"_errors": ["all down"]}), \
              patch.object(app.database, "save_prices") as save_prices, \

@@ -60,6 +60,14 @@ def clean_html(text):
     return html.unescape(text).strip()
 
 
+class FetchUserPostsError(RuntimeError):
+    """作者分页未完成；携带此前成功抓到的帖子，供批量抓取照常保存。"""
+
+    def __init__(self, message, posts):
+        super().__init__(message)
+        self.posts = posts
+
+
 class XueqiuFetcher:
     """多作者批量抓取器，复用单个浏览器实例"""
 
@@ -148,8 +156,9 @@ class XueqiuFetcher:
     def _fetch_api(self, path: str, params: dict) -> tuple:
         """调用雪球 API。
 
-        - 5xx 或 body 非 JSON（多半是 WAF 重挑战返回的 HTML）：抛 RuntimeError，
-          上层 `do_fetch` 会重启 singleton。
+        - 已识别的 WAF 重挑战由当前浏览器打开原请求地址完成验证，仅重试一次。
+          5xx、其它非 JSON 或恢复后仍失败则抛 RuntimeError，由批量层记录错误；
+          仅全部作者失败时上层 `do_fetch` 才重启 singleton。
         - 其它情况（含 4xx + error_code 的合法错误 JSON）：把 ``(status, data)``
           返回，由调用方根据上下文判断。例如 `user_timeline.json` 在 page>1 时
           常态化返回 400 + 10022 "请登录雪球查看更多内容"，那是分页边界不是失败。
@@ -157,8 +166,43 @@ class XueqiuFetcher:
           不能默认当成分页正常结束。
         """
         url = f"{path}?{urlencode(params)}"
+        for attempt in range(2):
+            payload = self._request_api(url)
+            status = payload.get("status")
+            body = payload.get("body") or ""
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                # fetch() 只读取响应文本，不会执行 EdgeOne 的 cookie 验证脚本。
+                # 导航到同一地址，让浏览器按正常页面流程完成验证，再重试 API。
+                if attempt == 0 and "<script" in body.lower() and "EO_Bot_Ssid" in body:
+                    print(f"  🔄 雪球浏览器验证，恢复后重试: {url}")
+                    self._recover_waf(url)
+                    continue
+                raise RuntimeError(
+                    f"xueqiu api {path} status={status} returned non-json (likely WAF)"
+                ) from e
+            if status is None or status >= 500:
+                raise RuntimeError(f"xueqiu api {path} server error status={status} body={data}")
+            if not isinstance(data, dict):
+                raise RuntimeError(f"xueqiu api {path} status={status} returned non-object JSON")
+            return status, data
+
+    def _recover_waf(self, url: str):
+        """复用现有浏览器完成验证，导航和重试均有超时，不递归重启会话。"""
         try:
-            payload = self._page.evaluate("""
+            self._page.goto(
+                f"https://xueqiu.com{url}",
+                wait_until="domcontentloaded",
+                timeout=self._API_TIMEOUT_MS,
+            )
+            self._page.wait_for_timeout(3000)
+        except Exception as e:
+            raise RuntimeError(f"xueqiu WAF 验证恢复失败: {e}") from e
+
+    def _request_api(self, url: str) -> dict:
+        try:
+            return self._page.evaluate("""
                 async ({ url, timeoutMs }) => {
                     const resp = await fetch(url, {
                         headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" },
@@ -170,19 +214,8 @@ class XueqiuFetcher:
             """, {"url": url, "timeoutMs": self._API_TIMEOUT_MS})
         except Exception as e:
             raise RuntimeError(
-                f"xueqiu api {path} 请求失败（可能超时 {self._API_TIMEOUT_MS / 1000:.0f}s）: {e}"
+                f"xueqiu api {url} 请求失败（可能超时 {self._API_TIMEOUT_MS / 1000:.0f}s）: {e}"
             ) from e
-        status = payload.get("status")
-        body = payload.get("body") or ""
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as e:
-            raise RuntimeError(
-                f"xueqiu api {path} status={status} returned non-json (likely WAF), body[:200]={body[:200]!r}"
-            ) from e
-        if status is None or status >= 500:
-            raise RuntimeError(f"xueqiu api {path} server error status={status} body={data}")
-        return status, data
 
     def _status_to_post(self, user_id: str, status: dict) -> dict:
         user = status.get("user", {})
@@ -235,13 +268,18 @@ class XueqiuFetcher:
         page = 1
 
         while True:
-            status_code, data = self._fetch_api("/v4/statuses/user_timeline.json", {
-                "user_id": user_id, "page": page, "count": page_size
-            })
+            try:
+                status_code, data = self._fetch_api("/v4/statuses/user_timeline.json", {
+                    "user_id": user_id, "page": page, "count": page_size
+                })
+            except Exception as e:
+                raise FetchUserPostsError(
+                    f"xueqiu user_timeline user={user_id} page={page}: {e}", result
+                ) from e
             # 雪球对未登录/非关注用户的 user_timeline 通常只放 page=1，page>1
             # 直接返回 4xx + error_code=10022 "请登录雪球查看更多内容"。这是
             # 分页边界，不是会话失效。但 page=1 就拿到 error_code 则确实是
-            # cookie 失效或 WAF 拦截，必须抛出让 singleton 重启。
+            # cookie 失效或 WAF 拦截，必须向批量层报告失败。
             err_code = data.get("error_code")
             if err_code:
                 if page == 1:
@@ -250,8 +288,8 @@ class XueqiuFetcher:
                     )
                 break
             # 4xx 但 body 里没有已知的 error_code：这不是文档记录过的分页边界
-            # 形态，可能是接口改版或限流的新错误结构。page=1 直接当失败抛出
-            # 重启 singleton；page>1 保守起见仍按分页结束处理，但打印明确的
+            # 形态，可能是接口改版或限流的新错误结构。page=1 直接报告失败；
+            # page>1 保守起见仍按分页结束处理，但打印明确的
             # 异常告警而不是当成正常空分页悄悄放过。
             if status_code is not None and status_code >= 400:
                 if page == 1:
@@ -328,6 +366,13 @@ class XueqiuFetcher:
             except Exception as e:
                 print(f"     ❌ {name} 抓取失败: {e}")
                 errors.append({"user_id": uid, "name": name, "error": str(e)})
+                if isinstance(e, FetchUserPostsError):
+                    for post in e.posts:
+                        if not post["user_name"]:
+                            post["user_name"] = name
+                    all_posts.extend(e.posts)
+                    if e.posts:
+                        print(f"     → 保留已抓到的 {len(e.posts)} 条，后续分页未完成")
                 self._page.wait_for_timeout(1000)
                 continue
             for p in posts:
